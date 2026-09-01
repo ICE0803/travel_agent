@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+*.egg-info/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# ⚠️ 含真实 API Key
+config.py
+
+# 本地模型权重（91MB，很大）
+data/models/
+
+# 用户记忆数据（含个人信息）
+data/memory/
+data/test_memory/
+
+# RAG 向量库（二进制 DB，可重新生成）
+.claude/skills/ask-question/data/rag_knowledge/
+
+# 测试生成的报告
+tests/results/
+
+# Claude 本地设置
+.claude/settings.local.json
+.claude/claudian-settings.json
+.claude/settings.json
+
+# AgentScope
+.agentscope/
+
+# 日志 / 系统
+*.log
+.DS_Store
+Thumbs.db

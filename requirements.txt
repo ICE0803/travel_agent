@@ -1,0 +1,19 @@
+# 基础（milvus_lite 依赖 pkg_resources，需 setuptools<82）
+setuptools>=69.0.0,<82
+
+# 多智能体框架
+agentscope==1.0.16
+
+# LLM 调用
+requests==2.32.3
+
+# RAG 与向量库（pymilvus[milvus_lite] 用于本地 .db 连接）
+# 注意：pymilvus 必须与 milvus-lite(3.x) 配对，2.6.x 客户端与 3.x 内核不兼容会导致本地库无法初始化
+pymilvus[milvus_lite]==3.0.1
+sentence-transformers==5.2.3
+
+# CLI 界面
+rich==13.9.4
+
+# 网络搜索（DDGS）
+ddgs==9.10.0

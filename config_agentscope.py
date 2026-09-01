@@ -1,5 +1,5 @@
 """
-AgentScope Configuration for Aligo Multi-Agent Travel Planning System
+AgentScope Configuration for ICE Multi-Agent Travel Planning System
 适配 AgentScope 1.0.16+
 """
 import agentscope
@@ -14,7 +14,7 @@ def init_agentscope():
     - 模型配置改为直接在Agent初始化时指定
     """
     agentscope.init(
-        project="Aligo-Travel-Planning",
+        project="ICE-Travel-Planning",
         name="multi_agent_system",
         logging_level="INFO"
     )

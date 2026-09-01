@@ -1,4 +1,4 @@
-# Aligo 商旅 Skills（Claude / Cursor 可用）
+# ICE 商旅 Skills（Claude / Cursor 可用）
 
 基于本项目 **agents/** 实际实现的业务 Skills，便于在 Claude 或 Cursor 中按意图调用对应 Agent。
 

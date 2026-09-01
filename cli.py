@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Aligo 商旅助手 - CLI 交互界面
+ICE 商旅助手 - CLI 交互界面
 使用 Rich 库实现美观的终端交互
 """
 import asyncio
@@ -36,8 +36,8 @@ from agents.orchestration_agent import OrchestrationAgent
 # 移除其他智能体的导入，改用懒加载
 
 
-class AligoCLI:
-    """Aligo 商旅助手 CLI"""
+class ICECLI:
+    """ICE 商旅助手 CLI"""
 
     def __init__(self):
         """初始化 CLI"""
@@ -53,7 +53,7 @@ class AligoCLI:
 
     def print_banner(self):
         """打印欢迎横幅"""
-        self.console.print("\n[bold cyan]🌏 Aligo 商旅助手[/bold cyan] - 让差旅更简单\n", style="bold")
+        self.console.print("\n[bold cyan]🌏 ICE 商旅助手[/bold cyan] - 让差旅更简单\n", style="bold")
 
     def print_help(self):
         """打印帮助信息"""
@@ -820,7 +820,7 @@ def main():
     """主函数"""
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() == "health":
         exit(run_health_check_standalone())
-    cli = AligoCLI()
+    cli = ICECLI()
     asyncio.run(cli.run())
 
 

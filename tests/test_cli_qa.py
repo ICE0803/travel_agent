@@ -1,7 +1,7 @@
 """
 CLI 自动问答测试 - 直接运行生成 QA 对文档
 Usage: python tests/test_cli_qa.py
-使用 cli.AligoCLI._display_results 统一打印结果，避免重复逻辑。
+使用 cli.ICECLI._display_results 统一打印结果，避免重复逻辑。
 """
 import sys
 import asyncio
@@ -22,11 +22,11 @@ logger = logging.getLogger(__name__)
 def capture_display_results(result_data: dict) -> str:
     """调用 cli 的 _display_results，将输出捕获为字符串（无 ANSI 颜色）。"""
     from rich.console import Console
-    from cli import AligoCLI
+    from cli import ICECLI
 
     capture = StringIO()
     console = Console(file=capture, force_terminal=False, no_color=True)
-    cli = AligoCLI()
+    cli = ICECLI()
     cli.console = console
     cli._display_results(result_data)
     return capture.getvalue().strip()

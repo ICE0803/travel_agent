@@ -135,7 +135,7 @@ async def main():
     user_query = "我从3月11日从北京出发，在杭州出差一周，3月18日返回北京，帮我安排行程"
 
     print("=" * 60)
-    print("Aligo 行程规划系统")
+    print("ICE 行程规划系统")
     print("=" * 60)
     print(f"\n用户需求: {user_query}\n")
 

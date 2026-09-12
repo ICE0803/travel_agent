@@ -20,6 +20,12 @@ import json
 import logging
 import asyncio
 
+try:
+    from config import INTENT_CONFIG
+    CONFIDENCE_THRESHOLD = float(INTENT_CONFIG.get("confidence_threshold", 0.5))
+except Exception:
+    CONFIDENCE_THRESHOLD = 0.5
+
 logger = logging.getLogger(__name__)
 
 
@@ -91,6 +97,11 @@ class OrchestrationAgent(AgentBase):
                 role="assistant"
             )
 
+        intention_summary = {
+            "intents": intention_data.get("intents", []),
+            "key_entities": intention_data.get("key_entities", {}),
+        }
+
         # 获取智能体调度计划
         agent_schedule = intention_data.get("agent_schedule", [])
         if not agent_schedule:
@@ -98,15 +109,53 @@ class OrchestrationAgent(AgentBase):
                 name=self.name,
                 content=json.dumps({
                     "status": "no_agents",
-                    "message": "没有需要调度的智能体"
-                }),
+                    "message": "没有需要调度的智能体",
+                    "intention": intention_summary,
+                }, ensure_ascii=False),
                 role="assistant"
             )
 
-        # 按优先级排序
-        sorted_schedule = sorted(agent_schedule, key=lambda x: x.get("priority", 999))
+        kept_schedule, dropped = [], []
+        for task in agent_schedule:
+            try:
+                conf = float(task.get("confidence", 1.0))
+            except (TypeError, ValueError):
+                conf = 1.0  # 模型没给或给了非数字，不因此拦截
+            (kept_schedule if conf >= CONFIDENCE_THRESHOLD else dropped).append((task, conf))
 
-        logger.info(f"Orchestrating {len(sorted_schedule)} agents")
+        if dropped:
+            logger.info(
+                "置信度过滤（阈值 %.2f）：丢弃 %s",
+                CONFIDENCE_THRESHOLD,
+                [(t.get("agent_name"), round(c, 3)) for t, c in dropped],
+            )
+
+        if not kept_schedule:
+            return Msg(
+                name=self.name,
+                content=json.dumps({
+                    "status": "low_confidence",
+                    "message": "意图置信度不足，未调度任何智能体",
+                    "threshold": CONFIDENCE_THRESHOLD,
+                    "dropped": [
+                        {"agent_name": t.get("agent_name"), "confidence": round(c, 3)}
+                        for t, c in dropped
+                    ],
+                    "intention": intention_summary,
+                }, ensure_ascii=False),
+                role="assistant"
+            )
+
+        # 按优先级排序（只排通过置信度过滤的任务）
+        sorted_schedule = sorted(
+            [t for t, _ in kept_schedule],
+            key=lambda x: x.get("priority", 999),
+        )
+
+        logger.info(
+            "Orchestrating %d agents (置信度过滤掉 %d 个)",
+            len(sorted_schedule), len(dropped),
+        )
 
         # 准备上下文信息
         context = self._prepare_context(intention_data)

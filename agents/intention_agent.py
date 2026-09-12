@@ -123,6 +123,7 @@ class IntentionAgent(AgentBase):
 - "我去过北京吗？" → memory_query（询问自己的历史）
 - "北京怎么样？" / "北京有什么好玩的？" → information_query（询问客观信息）
 - "我想去北京" → itinerary_planning（规划未来行程）
+- "你好" / "你是谁" / "讲个笑话" → chitchat（闲聊，不调用任何 Skill）
 
 优先级规则：
 - memory_query 优先于 information_query（当问题涉及用户自己的历史时）
@@ -181,11 +182,23 @@ class IntentionAgent(AgentBase):
         {{
             "agent_name": "子智能体名称",
             "priority": 1,
+            "confidence": 0.95,
             "reason": "调用该智能体的原因和依据",
             "expected_output": "期望该智能体提供什么输出"
         }}
     ]
 }}
+
+【闲聊 / 无关问题处理】
+如果用户输入与差旅出行、行程规划**完全无关**（打招呼、闲聊、让他写诗、问与差旅无关的百科问题等）：
+- intents 中给出一个 type 为 "chitchat" 的意图，并按实际情况填写 confidence
+- **agent_schedule 必须输出空数组 []**，不要调用任何 Skill
+- 不要为了"显得有用"而把无关问题硬解释成差旅需求
+
+【置信度要求】
+- agent_schedule 中**每一项都必须给出 confidence**（0~1），表示"确实需要调用这个智能体"的把握程度
+- 参考区间：很有把握 0.85~1.0；比较确定 0.6~0.85；不太确定 0.4~0.6；只是猜测 < 0.4
+- 系统会**丢弃 confidence < 0.5 的调度项**，所以不确定时不要硬凑智能体
 
 【重要提示 - 优先级设置规则】
 优先级数字相同的智能体会**并行执行**，不同优先级按顺序批次执行。

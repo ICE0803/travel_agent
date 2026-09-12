@@ -5,6 +5,7 @@ ICE 商旅助手 - CLI 交互界面
 使用 Rich 库实现美观的终端交互
 """
 import asyncio
+import logging
 import sys
 import os
 from typing import Optional
@@ -35,6 +36,8 @@ from utils.llm_resilience import retry_with_backoff, run_health_check as check_l
 from agents.intention_agent import IntentionAgent
 from agents.orchestration_agent import OrchestrationAgent
 # 移除其他智能体的导入，改用懒加载
+
+logger = logging.getLogger(__name__)
 
 
 class ICECLI:
@@ -104,8 +107,11 @@ class ICECLI:
                     "base_url": LLM_CONFIG["base_url"],
                     "timeout": float(timeout_sec),
                 },
-                temperature=LLM_CONFIG.get("temperature", 0.7),
-                max_tokens=LLM_CONFIG.get("max_tokens", 2000),
+                # agentscope 1.x 只透传 generate_kwargs，直传 temperature/max_tokens 会被静默忽略
+                generate_kwargs={
+                    "temperature": LLM_CONFIG.get("temperature", 0.7),
+                    "max_tokens": LLM_CONFIG.get("max_tokens", 2000),
+                },
             )
 
             # 初始化记忆管理器（传入LLM模型用于总结）
@@ -280,12 +286,40 @@ class ICECLI:
         if not results:
             # 情况1: 没有任何智能体被调用
             status = result_data.get("status", "unknown")
+            intents = (result_data.get("intention") or {}).get("intents", [])
+
             if status == "no_agents":
-                self.console.print("✓ 好的，我已记录下来。", style="green")
-                self.console.print("\n💡 您可以继续补充信息，或者尝试：", style="dim")
-                self.console.print("  • 规划行程：「帮我规划去北京的行程」", style="dim")
-                self.console.print("  • 查询信息：「北京的天气怎么样」", style="dim")
-                self.console.print("  • 问问题：「差旅标准是多少」", style="dim")
+                if self._is_chitchat(intents):
+                    # 闲聊 / 无关问题：礼貌告知服务范围并引导
+                    self.console.print(
+                        "🙋 抱歉，我目前只提供「差旅出行与行程规划」相关的服务。",
+                        style="yellow")
+                    self.console.print("\n💡 您可以试试：", style="dim")
+                    self.console.print("  • 规划行程：「帮我规划去北京的行程」", style="dim")
+                    self.console.print("  • 查询信息：「北京的天气怎么样」", style="dim")
+                    self.console.print("  • 问问题：「差旅标准是多少」", style="dim")
+                else:
+                    self.console.print("✓ 好的，我已记录下来。", style="green")
+                    self.console.print("\n💡 您可以继续补充信息，或者尝试：", style="dim")
+                    self.console.print("  • 规划行程：「帮我规划去北京的行程」", style="dim")
+                    self.console.print("  • 查询信息：「北京的天气怎么样」", style="dim")
+                    self.console.print("  • 问问题：「差旅标准是多少」", style="dim")
+
+            elif status == "low_confidence":
+                # 置信度不足：让用户补充信息，而不是拿猜测去乱调 Agent
+                self.console.print(
+                    "🤔 我不太确定您的具体需求，能再补充一点信息吗？", style="yellow")
+                dropped = result_data.get("dropped", [])
+                if dropped:
+                    names = "、".join(
+                        self._get_agent_display_name(d.get("agent_name", ""))
+                        for d in dropped
+                    )
+                    self.console.print(
+                        f"  （识别到的意图把握不足：{names}）", style="dim")
+                self.console.print(
+                    "  例如补充出发地、目的地、日期，或直接说明想查什么。", style="dim")
+
             else:
                 self.console.print("未能获取有效结果，请重新描述您的需求。", style="yellow")
         else:
@@ -632,6 +666,19 @@ class ICECLI:
             "memory_query": "记忆查询",
         }
         return agent_display_names.get(agent_name, agent_name)
+
+    @staticmethod
+    def _is_chitchat(intents) -> bool:
+        """判断意图列表中是否包含闲聊意图"""
+        if not isinstance(intents, list):
+            return False
+        for it in intents:
+            if not isinstance(it, dict):
+                continue
+            itype = str(it.get("type", "")).strip().lower()
+            if itype in ("chitchat", "chat", "small_talk", "闲聊"):
+                return True
+        return False
 
     def show_status(self):
         """显示当前状态"""

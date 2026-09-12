@@ -74,8 +74,10 @@ async def main():
         model_name=LLM_CONFIG["model_name"],
         api_key=LLM_CONFIG["api_key"],
         client_kwargs={"base_url": LLM_CONFIG["base_url"]},
-        temperature=LLM_CONFIG.get("temperature", 0.7),
-        max_tokens=LLM_CONFIG.get("max_tokens", 2000),
+        generate_kwargs={
+            "temperature": LLM_CONFIG.get("temperature", 0.7),
+            "max_tokens": LLM_CONFIG.get("max_tokens", 2000),
+        },
     )
 
     # 初始化记忆管理器

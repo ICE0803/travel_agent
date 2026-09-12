@@ -64,8 +64,10 @@ async def test_intention_agent():
             client_kwargs={
                 "base_url": LLM_CONFIG["base_url"],
             },
-            temperature=LLM_CONFIG.get("temperature", 0.7),
-            max_tokens=LLM_CONFIG.get("max_tokens", 2000),
+            generate_kwargs={
+                "temperature": LLM_CONFIG.get("temperature", 0.7),
+                "max_tokens": LLM_CONFIG.get("max_tokens", 2000),
+            },
         )
         print(f"✓ 模型创建成功")
     except Exception as e:

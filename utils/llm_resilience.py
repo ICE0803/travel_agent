@@ -96,8 +96,7 @@ async def run_health_check(
             model_name=model_name,
             api_key=api_key,
             client_kwargs={"base_url": base_url, "timeout": timeout_sec},
-            temperature=0,
-            max_tokens=5,
+            generate_kwargs={"temperature": 0, "max_tokens": 5},
         )
         # 最小请求
         messages = [{"role": "user", "content": "1"}]

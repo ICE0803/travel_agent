@@ -298,7 +298,7 @@ def main():
                     
                     title = metadata.get('title', 'Unknown')
                     distance = doc.get('distance', 0.0)
-                    print(f"      [{i}] {title} (相似度: {1-distance:.3f})")
+                    print(f"      [{i}] {title} (相似度: {distance:.3f})")
             else:
                 print("   ❌ 未找到相关文档")
 

@@ -17,3 +17,10 @@ rich==13.9.4
 
 # 网络搜索（DDGS）
 ddgs==9.10.0
+
+# 长期记忆持久化（PostgreSQL）
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.4
+
+# 缓存与短期记忆（Redis）
+redis==5.2.1

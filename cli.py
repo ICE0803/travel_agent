@@ -25,6 +25,7 @@ from rich.text import Text
 import json
 
 # 导入系统组件
+from context.backends import init_backends, get_backend, close_backends
 from agentscope.model import OpenAIChatModel
 from config_agentscope import init_agentscope
 from config import LLM_CONFIG, SYSTEM_CONFIG, RESILIENCE_CONFIG
@@ -91,6 +92,8 @@ class ICECLI:
         with self.console.status("初始化中...", spinner="dots"):
             # 初始化AgentScope
             init_agentscope()
+            backend = init_backends()
+            logger.info("存储后端: %s", backend)
 
             # 初始化模型
             timeout_sec = SYSTEM_CONFIG.get("timeout", 60)
@@ -145,7 +148,9 @@ class ICECLI:
                 half_open_successes=rc.get("circuit_half_open_successes", 2),
             )
 
-        self.console.print(f"✓ 就绪 (用户: {self.user_id}) - 输入 help 查看帮助\n", style="green")
+        self.console.print(
+            f"✓ 就绪 (用户: {self.user_id} | 存储: {get_backend()}) - 输入 help 查看帮助\n",
+            style="green")
 
     async def process_query(self, user_input: str):
         """
@@ -655,6 +660,21 @@ class ICECLI:
         self.console.print(memory_table)
         self.console.print()
 
+
+        # 缓存命中率（Redis）
+        stats = self.memory_manager.get_cache_stats()
+        if stats.get("enabled"):
+            p, s = stats["preferences"], stats["summary"]
+            self.console.print(
+                f"📦 缓存命中率: 偏好 {p['rate']}% ({p['hit']}/{p['total']}) | "
+                f"总结 {s['rate']}% ({s['hit']}/{s['total']})",
+                style="dim")
+        else:
+            self.console.print("📦 缓存: 未启用（Redis 不可用）", style="dim")
+        self.console.print()
+
+
+
         # 历史对话
         recent_messages = self.memory_manager.short_term.get_recent_context(n_turns=5)
         if recent_messages:
@@ -767,6 +787,7 @@ class ICECLI:
 
                 if command == "exit":
                     self.memory_manager.end_session()
+                    close_backends()
                     self.console.print("再见！", style="cyan")
                     break
                 elif command == "help":

@@ -1,6 +1,6 @@
 # ICE 智能旅行助手
 
-基于 **AgentScope** 多智能体框架 + **大语言模型（OpenAI 兼容接口，可通过 `config.py` 配置，如豆包 / DeepSeek）** 的多智能体旅行规划系统。采用 **Plan-and-Execute** 架构，实现语义意图识别、两层记忆系统、RAG 知识库、联网搜索和优先级并行调度。
+基于 **AgentScope** 多智能体框架 + **大语言模型（OpenAI 兼容接口，可通过 `config.py` 配置，如豆包 / DeepSeek）** 的多智能体旅行规划系统。采用 **Plan-and-Execute** 架构，实现语义意图识别、两层记忆系统（**Redis + PostgreSQL**）、RAG 知识库、联网搜索和优先级并行调度。
 
 ## ✨ 核心亮点
 
@@ -10,11 +10,12 @@
 - 自然语言理解，不依赖关键词匹配
 
 ### 🧠 两层记忆架构
-- **短期记忆**：会话级**滑动窗口**，保存最近 `10` 轮对话，用于上下文理解与消歧
-- **长期记忆**：**JSON 文件持久化**（`data/memory/{user_id}.json`），保存用户偏好、历史行程、全量聊天记录，支持**跨会话**访问
-- **LLM 异步总结**：定期对长期记忆生成摘要，随上下文注入意图识别
+- **短期记忆**：**Redis LIST** 存储，`RPUSH` + `LTRIM` 实现固定长度滑动窗口，保存最近 `10` 轮对话；每次写入续期 `EXPIRE`（**TTL 1 小时**），做到会话级滑动过期
+- **长期记忆**：**PostgreSQL** 持久化（`users` / `user_preferences` / `chat_history` / `trip_history`），保存用户偏好、历史行程、全量聊天记录，支持**跨会话**访问
+- **Redis 缓存层**：偏好热数据（**Write-Through** 写库即刷新，TTL **10 分钟**）+ LLM 总结结果（TTL **30 分钟**）；`status` 命令可查看实时命中率
+- **LLM 异步总结**：定期对长期记忆生成摘要，随上下文注入意图识别；用 `chat_history.MAX(id)` 作为**版本号 watermark**，避免「写入新消息后仍返回旧总结」的脏读
 - **偏好智能识别**：自动判断"追加"（"我还喜欢如家"）还是"覆盖"（"我搬家到上海了"）
-- > 架构上预留了生产环境演进：短期记忆可替换为 **Redis**（TTL 会话共享），长期记忆可替换为 **PostgreSQL**；当前 Demo 以内存 + JSON 实现，接口已封装在 `context/` 下，方便切换。
+- **自动降级**：`STORAGE_CONFIG["backend"]="auto"`（默认）时若连不上 PostgreSQL / Redis，自动退回 JSON 文件 + 内存实现，功能不中断；连接池与降级策略集中在 `context/backends.py`，表结构见 `context/schema.sql`
 
 ### 📚 RAG 知识库
 - **Milvus Lite** 向量数据库（本地 `.db`）+ **bge-small-zh-v1.5** 中文 Embedding 模型（本地部署 `data/models/`）
@@ -101,12 +102,14 @@
 | 用户偏好记忆准确率 | - | 95% | 智能识别追加/覆盖 |
 | 系统响应时间 | 30 秒（串行） | 15 秒（优先级并行） | 同优先级 Agent 并行执行 |
 | 系统启动速度 | 未优化 | 快 | 懒加载 + 渐进式披露 |
+| 缓存命中率 | - | `status` 实时查看 | Redis 偏好 / 总结命中计数（会话内累计值） |
 
 **优化路径**：
 1. **V1.0**：关键词匹配意图识别 + 串行调度
 2. **V2.0**：两层记忆系统 + RAG 知识库 + 联网搜索
 3. **V3.0**：LLM 语义理解意图识别 + 优先级并行调度
 4. **V4.0**：Skill Plugins 插件化架构 + LazyAgentRegistry + 懒加载
+5. **V5.0**：PostgreSQL 长期记忆 + Redis 缓存层（Write-Through / Lazy Loading / watermark 防脏读）
 
 ---
 
@@ -125,15 +128,23 @@
 
 ### 2. 两层记忆系统
 
-**短期记忆（会话级）**
-- 内存中的滑动窗口，保存最近 10 轮对话（每轮 = 用户 + 助手）
+**短期记忆（会话级，Redis）**
+- Redis **LIST** 结构，key = `session:{session_id}:messages`
+- 保存最近 10 轮对话（每轮 = 用户 + 助手），`LTRIM` 自动淘汰旧消息
+- 每次写入 `EXPIRE` 续期，TTL 1 小时（滑动过期）
+- 按 `session_id` 隔离，多会话互不干扰；`clear` / `end_session` 时 `DEL` 清理
 
-**长期记忆（持久化）**
-- **JSON 文件**：`data/memory/{user_id}.json`，包含用户偏好、历史行程、完整聊天历史和统计
-- **偏好管理**：支持动态任意偏好类型，智能识别追加/覆盖动作
-- **历史行程**：出发地、目的地、时间、目的，支持跨会话查询
-- **统计**：常去目的地、总行程数
-- **LLM 异步总结**：自动生成历史摘要，注入上下文
+**长期记忆（跨会话，PostgreSQL）**
+- 4 张表：`users` / `user_preferences` / `chat_history` / `trip_history`
+- **偏好管理**：`value` 用 **JSONB** 存储，标量或列表均可，新增偏好类型无需改表；`ON CONFLICT DO UPDATE` 保证幂等写入
+- **历史行程**：出发地、目的地、时间、目的，按 `(user_id, created_at DESC)` 索引查询
+- **统计**：总行程数、总消息数、常去目的地全部改为 **SQL 聚合查询**（`GROUP BY`），不再全量加载到内存
+- **LLM 异步总结**：自动生成历史摘要并缓存到 Redis
+
+**缓存层（Redis）**
+- 偏好热数据：**Write-Through**（写库后立即刷新）+ **Lazy Loading**（未命中回源并回填），TTL 10 分钟
+- LLM 总结：TTL 30 分钟，用 `chat_history.MAX(id)` 做版本号，有新消息即自动失效
+- 命中 / 未命中计数写入 Redis，`status` 命令展示实时命中率
 
 ### 3. RAG 知识库
 
@@ -188,13 +199,56 @@ LLM_CONFIG = {
 }
 ```
 
-### 3. 初始化知识库
+### 3. 启动 Redis 与 PostgreSQL
+
+系统默认（`STORAGE_CONFIG["backend"] = "auto"`）会优先连接 Redis + PostgreSQL；两者都连不上时自动降级为 JSON + 内存，功能仍可用。
+
+```bash
+# 方式一：本地 / WSL 安装
+sudo apt install -y postgresql redis-server
+sudo service postgresql start && sudo service redis-server start
+
+# 方式二：Docker
+docker run -d --name travel-redis -p 6379:6379 redis:7-alpine
+docker run -d --name travel-postgres -p 5432:5432 \
+  -e POSTGRES_DB=travel_agent -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=你的密码 postgres:16-alpine
+```
+
+确认两个服务可连：
+
+```bash
+psql -h localhost -U postgres -c "SELECT 1"
+redis-cli ping          # 期望 PONG
+```
+
+连接参数在 `config.py` 的 `STORAGE_CONFIG` 中配置。
+
+### 4. 建表
+
+```bash
+python scripts/init_db.py
+```
+
+幂等，可重复执行。
+
+### 5. （可选）迁移历史 JSON 记忆
+
+如果你之前用 JSON 模式跑过，把旧数据迁到 PostgreSQL：
+
+```bash
+python scripts/migrate_json_to_pg.py
+```
+
+> ⚠️ **只跑一次**。`chat_history` / `trip_history` 没有唯一约束，重复执行会产生重复行。
+
+### 6. 初始化知识库
 
 ```bash
 python .claude/skills/ask-question/script/init_knowledge_base.py
 ```
 
-### 4. 启动系统
+### 7. 启动系统
 
 ```bash
 python cli.py
@@ -230,7 +284,7 @@ python cli.py
 | 命令 | 说明 |
 |------|------|
 | `help` | 显示帮助 |
-| `status` | 查看当前状态和记忆 |
+| `status` | 查看当前状态、记忆和**缓存命中率** |
 | `health` | 检查 LLM 服务是否可用并显示熔断器状态 |
 | `clear` | 清空当前任务（保留长期记忆） |
 | `history` | 查看历史行程 |
@@ -278,11 +332,17 @@ travel_agent/
 │   ├── query-info/                  # 信息查询
 │   └── memory-query/                # 记忆查询
 ├── context/                         # 记忆系统
-│   ├── memory_manager.py            # 记忆管理器
-│   ├── short_term_memory.py         # 短期记忆（滑动窗口）
-│   └── long_term_memory.py          # 长期记忆（JSON 持久化）
+│   ├── backends.py                  # 连接池单例（PG ConnectionPool + Redis）+ 自动降级
+│   ├── schema.sql                   # PostgreSQL 表结构（幂等）
+│   ├── memory_manager.py            # 记忆管理器（LLM 总结缓存 + 命中率统计）
+│   ├── short_term_memory.py         # 短期记忆（Redis LIST + TTL 滑动窗口）
+│   └── long_term_memory.py          # 长期记忆（PostgreSQL + 偏好 Write-Through 缓存）
+├── scripts/
+│   ├── init_db.py                   # 建表（幂等）
+│   └── migrate_json_to_pg.py        # 历史 JSON 记忆迁移到 PostgreSQL
 ├── data/
-│   ├── memory/                      # 长期记忆 JSON（user_id.json）
+│   ├── memory/                      # 历史 JSON 记忆（降级模式使用）
+│   ├── memory_bak/                  # 迁移前备份
 │   └── models/bge-small-zh-v1.5/    # 本地 Embedding 模型
 ├── tests/                           # 测试脚本
 ├── utils/                           # 工具与连接可用性
@@ -305,10 +365,12 @@ travel_agent/
 - 📦 **AgentScope 1.0.16** - 多智能体框架
 - 🤖 **大语言模型（OpenAI 兼容）** - 通过 `OpenAIChatModel` 配置，如 DeepSeek / 豆包
 
-### 数据存储
-- 🗄️ **JSON 文件** - 长期记忆持久化（`data/memory/{user_id}.json`）
-- 💾 **内存滑动窗口** - 短期记忆（会话级）
+### 数据存储与缓存
+- 🐘 **PostgreSQL** - 长期记忆持久化（`users` / `user_preferences` / `chat_history` / `trip_history`）
+- ⚡ **Redis** - 短期记忆会话窗口 + 偏好热数据 + LLM 总结缓存
+- 🔌 **psycopg3 + psycopg_pool** - PostgreSQL 连接池（进程级单例）
 - 🔍 **Milvus Lite** - 向量数据库（本地 `.db`，RAG 知识库）
+- 🔁 **自动降级** - 连不上 PG / Redis 时退回 JSON + 内存（`context/backends.py`）
 
 ### 向量化与检索
 - 🧠 **bge-small-zh-v1.5** - 中文 Embedding 模型（本地部署）
@@ -345,9 +407,11 @@ travel_agent/
 - Embedding 模型为本地 `data/models/bge-small-zh-v1.5/`
 
 ### 数据存储
-- **短期记忆**：内存滑动窗口（会话级）
-- **长期记忆**：JSON 文件（`data/memory/{user_id}.json`）
-- README 中提到的 **Redis / PostgreSQL** 是**面向生产环境的架构演进方案**，当前 Demo 以 JSON + 内存落地，接口已封装在 `context/` 便于切换
+- **短期记忆**：Redis LIST（会话级，TTL 1 小时）
+- **长期记忆**：PostgreSQL（`travel_agent` 库，4 张表）
+- **缓存**：Redis 存偏好热数据（TTL 10 分钟）与 LLM 总结（TTL 30 分钟）
+- **首次使用**必须先跑 `python scripts/init_db.py` 建表
+- **降级开关**：`STORAGE_CONFIG["backend"]` 设为 `"local"` 可强制走 JSON + 内存（离线演示 / CI）；设为 `"postgres"` 则连接失败时直接抛错（便于暴露配置问题）；默认 `"auto"` 自动降级
 
 ### 知识库初始化
 - 首次运行前必须初始化 RAG 知识库：
@@ -362,7 +426,8 @@ travel_agent/
 
 ## 🚀 未来规划
 
-- [ ] 完整实现 PostgreSQL 持久化 / Redis 缓存层（当前为 JSON + 内存 Demo）
+- [x] ~~PostgreSQL 持久化 / Redis 缓存层~~（已完成：`context/backends.py` + `context/schema.sql`）
+- [ ] 缓存命中率的独立基准测试（冷启动 / 多会话场景，目前 `status` 显示的是会话内累计值）
 - [ ] 更完整的多路召回（向量 + BM25 混合检索、Rerank）
 - [ ] 支持更多 LLM / 切换模型
 - [ ] Web 界面（FastAPI + React）

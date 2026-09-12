@@ -8,6 +8,12 @@ import os
 from datetime import datetime
 from pathlib import Path
 import logging
+from psycopg.types.json import Jsonb 
+
+from config import STORAGE_CONFIG
+from .backends import get_pg_pool, get_redis
+
+PREF_TTL = STORAGE_CONFIG.get("ttl", {}).get("preferences", 600)
 
 logger = logging.getLogger(__name__)
 
@@ -21,23 +27,41 @@ class LongTermMemory:
     """
 
     def __init__(self, user_id: str, storage_path: str = "data/memory"):
-        """
-        初始化长期记忆
-
-        Args:
-            user_id: 用户ID
-            storage_path: 存储路径
-        """
         self.user_id = user_id
         self.storage_path = storage_path
         self.db_path = os.path.join(storage_path, f"{user_id}.json")
 
-        # 确保存储目录存在
-        Path(storage_path).mkdir(parents=True, exist_ok=True)
+        self._pg = get_pg_pool()
+        self._redis = get_redis()
 
-        # 加载或初始化数据
-        self.data = self._load()
-        logger.info(f"Long-term memory initialized for user: {user_id}")
+        # 偏好缓存 key（命中率统计用）
+        self._pref_cache_key = f"user:{user_id}:prefs"
+        self.pref_hit_key = f"{self._pref_cache_key}:hit"
+        self.pref_miss_key = f"{self._pref_cache_key}:miss"
+
+        if self._pg is not None:
+            self._ensure_user()
+            logger.info("Long-term memory initialized for user: %s (postgres)", user_id)
+        else:
+            Path(storage_path).mkdir(parents=True, exist_ok=True)
+            self.data = self._load()          # 原 JSON 逻辑保留
+            logger.info("Long-term memory initialized for user: %s (json)", user_id)
+
+
+    def _ensure_user(self):
+        self._execute(
+            "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+            (self.user_id,),
+        )
+
+    def _execute(self, sql, params=None, fetch=True):
+        with self._pg.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params or ())
+                if fetch and cur.description is not None:
+                    return cur.fetchall()
+                return None
+
 
     def _load(self) -> Dict[str, Any]:
         """从文件加载数据"""
@@ -138,221 +162,259 @@ class LongTermMemory:
         except Exception as e:
             logger.error(f"Failed to save long-term memory: {e}")
 
-    def save_preference(self, pref_type: str, value: Any):
-        """
-        保存用户偏好（列表格式）
-
-        Args:
-            pref_type: 偏好类型
-            value: 偏好值
-        """
-        # 查找是否已存在该类型的偏好
-        preferences = self.data["preferences"]
-        found = False
-
-        for pref in preferences:
-            if pref.get("type") == pref_type:
-                pref["value"] = value
-                found = True
-                break
-
-        # 如果不存在，添加新的偏好
-        if not found:
-            preferences.append({"type": pref_type, "value": value})
-
-        self._save()
-        logger.info(f"Saved preference: {pref_type} = {value}")
-
     def get_preference(self, pref_type: str = None) -> Any:
-        """
-        获取用户偏好
-
-        Args:
-            pref_type: 偏好类型，None返回字典格式的全部偏好
-
-        Returns:
-            偏好值或偏好字典
-        """
-        preferences = self.data["preferences"]
-
+        prefs = self._get_prefs_cached()
         if pref_type is None:
-            # 返回字典格式，方便调用方使用
-            result = {}
-            for pref in preferences:
-                result[pref.get("type")] = pref.get("value")
-            return result
+            return prefs
+        return prefs.get(pref_type)
+
+    def _get_prefs_cached(self) -> Dict[str, Any]:
+        """先查 Redis，未命中回源存储并回填（Lazy Loading）"""
+        if self._redis is not None:
+            try:
+                raw = self._redis.get(self._pref_cache_key)
+                if raw is not None:
+                    self._redis.incr(self.pref_hit_key)
+                    return json.loads(raw)
+                self._redis.incr(self.pref_miss_key)
+            except Exception as e:
+                logger.warning("偏好缓存读取失败，回源: %s", e)
+
+        prefs = self._load_prefs_from_store()
+        self._write_pref_cache(prefs)
+        return prefs
+
+    def _load_prefs_from_store(self) -> Dict[str, Any]:
+        if self._pg is not None:
+            rows = self._execute(
+                "SELECT pref_type, value FROM user_preferences WHERE user_id = %s",
+                (self.user_id,),
+            )
+            return {r[0]: r[1] for r in rows}
+        return {p.get("type"): p.get("value") for p in self.data["preferences"]}
+
+    def _write_pref_cache(self, prefs: Dict[str, Any]):
+        if self._redis is None:
+            return
+        try:
+            self._redis.setex(
+                self._pref_cache_key, PREF_TTL,
+                json.dumps(prefs, ensure_ascii=False),
+            )
+        except Exception as e:
+            logger.warning("偏好缓存写入失败: %s", e)
+
+    def save_preference(self, pref_type: str, value: Any):
+        if self._pg is not None:
+            self._execute(
+                """
+                INSERT INTO user_preferences (user_id, pref_type, value, updated_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (user_id, pref_type)
+                DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+                """,
+                (self.user_id, pref_type, Jsonb(value)),
+            )
         else:
-            # 查找特定类型的偏好
+            # ↓↓↓ 原 JSON 逻辑，原样保留 ↓↓↓
+            preferences = self.data["preferences"]
+            found = False
             for pref in preferences:
                 if pref.get("type") == pref_type:
-                    return pref.get("value")
-            return None
+                    pref["value"] = value
+                    found = True
+                    break
+            if not found:
+                preferences.append({"type": pref_type, "value": value})
+            self._save()
+
+        # Write-Through：写库后立即刷新缓存
+        self._write_pref_cache(self._load_prefs_from_store())
+        logger.info("Saved preference: %s = %s", pref_type, value)
+
+    def _append_to_list_pref(self, pref_type: str, item: str):
+        existing = self.get_preference(pref_type)
+        if not isinstance(existing, list):
+            existing = [existing] if existing else []
+        if item not in existing:
+            existing.append(item)
+        self.save_preference(pref_type, existing)
 
     def add_hotel_brand(self, brand: str):
-        """添加酒店品牌偏好（追加到列表）"""
-        # 查找 hotel_brands 偏好
-        preferences = self.data["preferences"]
-        found = False
-
-        for pref in preferences:
-            if pref.get("type") == "hotel_brands":
-                # 确保 value 是列表
-                if not isinstance(pref["value"], list):
-                    pref["value"] = [pref["value"]] if pref["value"] else []
-
-                # 追加品牌
-                if brand not in pref["value"]:
-                    pref["value"].append(brand)
-                found = True
-                break
-
-        # 如果不存在，创建新的
-        if not found:
-            preferences.append({"type": "hotel_brands", "value": [brand]})
-
-        self._save()
-        logger.info(f"Added hotel brand preference: {brand}")
+        self._append_to_list_pref("hotel_brands", brand)
 
     def add_airline(self, airline: str):
-        """添加航空公司偏好（追加到列表）"""
-        # 查找 airlines 偏好
-        preferences = self.data["preferences"]
-        found = False
-
-        for pref in preferences:
-            if pref.get("type") == "airlines":
-                # 确保 value 是列表
-                if not isinstance(pref["value"], list):
-                    pref["value"] = [pref["value"]] if pref["value"] else []
-
-                # 追加航空公司
-                if airline not in pref["value"]:
-                    pref["value"].append(airline)
-                found = True
-                break
-
-        # 如果不存在，创建新的
-        if not found:
-            preferences.append({"type": "airlines", "value": [airline]})
-
-        self._save()
-        logger.info(f"Added airline preference: {airline}")
+        self._append_to_list_pref("airlines", airline)
 
     def add_chat_message(self, role: str, content: str, session_id: str = None):
-        """
-        添加聊天消息到长期记忆
-
-        Args:
-            role: 角色 (user/assistant)
-            content: 消息内容
-            session_id: 会话ID（可选）
-        """
-        message = {
-            "role": role,
-            "content": content,
-            "timestamp": datetime.now().isoformat(),
-            "session_id": session_id
-        }
-
-        self.data["chat_history"].append(message)
-        self.data["statistics"]["total_messages"] += 1
-        self._save()
-        logger.debug(f"Added chat message to long-term memory: {role}")
+        if self._pg is not None:
+            self._execute(
+                """INSERT INTO chat_history (user_id, session_id, role, content, created_at)
+                   VALUES (%s, %s, %s, %s, now())""",
+                (self.user_id, session_id, role, content),
+                fetch=False,
+            )
+        else:
+            message = {
+                "role": role, "content": content,
+                "timestamp": datetime.now().isoformat(), "session_id": session_id,
+            }
+            self.data["chat_history"].append(message)
+            self.data["statistics"]["total_messages"] += 1
+            self._save()
+        logger.debug("Added chat message to long-term memory: %s", role)
 
     def get_chat_history(self, limit: int = None, session_id: str = None) -> List[Dict[str, Any]]:
-        """
-        获取聊天历史
+        if self._pg is None:
+            messages = self.data["chat_history"]
+            if session_id:
+                messages = [m for m in messages if m.get("session_id") == session_id]
+            if limit:
+                return messages[-limit:]
+            return messages
 
-        Args:
-            limit: 返回数量限制
-            session_id: 会话ID（只返回特定会话的消息）
-
-        Returns:
-            消息列表
-        """
-        messages = self.data["chat_history"]
-
+        sql = "SELECT role, content, created_at, session_id FROM chat_history WHERE user_id = %s"
+        params: List[Any] = [self.user_id]
         if session_id:
-            messages = [m for m in messages if m.get("session_id") == session_id]
+            sql += " AND session_id = %s"
+            params.append(session_id)
+        sql += " ORDER BY id DESC LIMIT %s"
+        params.append(limit if limit else 1_000_000)
 
-        if limit:
-            return messages[-limit:]
-        return messages
+        rows = self._execute(sql, tuple(params))
+        # 倒序取出后反转，恢复时间正序（与 JSON 版语义一致）
+        return [
+            {
+                "role": r[0],
+                "content": r[1],
+                "timestamp": r[2].isoformat() if r[2] else "",
+                "session_id": r[3],
+            }
+            for r in reversed(rows)
+        ]
 
     def save_trip_history(self, trip_info: Dict[str, Any]):
-        """
-        保存行程历史
-
-        Args:
-            trip_info: 行程信息
-        """
-        trip_record = {
-            "trip_id": f"trip_{len(self.data['trip_history']) + 1}",
-            "timestamp": datetime.now().isoformat(),
-            **trip_info
-        }
-
-        self.data["trip_history"].append(trip_record)
-
-        # 更新统计信息
-        self.data["statistics"]["total_trips"] += 1
-
-        # 更新常去目的地统计
-        destination = trip_info.get("destination")
-        if destination:
-            freq = self.data["statistics"]["frequent_destinations"]
-            freq[destination] = freq.get(destination, 0) + 1
-
-        self._save()
-        logger.info(f"Saved trip history: {trip_record['trip_id']}")
+        if self._pg is not None:
+            self._execute(
+                """INSERT INTO trip_history
+                     (user_id, origin, destination, start_date, end_date, purpose, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, now())""",
+                (self.user_id, trip_info.get("origin"), trip_info.get("destination"),
+                 trip_info.get("start_date"), trip_info.get("end_date"),
+                 trip_info.get("purpose")),
+                fetch=False,
+            )
+        else:
+            trip_record = {
+                "trip_id": f"trip_{len(self.data['trip_history']) + 1}",
+                "timestamp": datetime.now().isoformat(),
+                **trip_info,
+            }
+            self.data["trip_history"].append(trip_record)
+            self.data["statistics"]["total_trips"] += 1
+            destination = trip_info.get("destination")
+            if destination:
+                freq = self.data["statistics"]["frequent_destinations"]
+                freq[destination] = freq.get(destination, 0) + 1
+            self._save()
+        logger.info("Saved trip history: %s -> %s",
+                    trip_info.get("origin"), trip_info.get("destination"))
 
     def get_trip_history(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """
-        获取历史行程
+        if self._pg is None:
+            return self.data["trip_history"][-limit:] if limit else self.data["trip_history"]
 
-        Args:
-            limit: 返回数量限制
-
-        Returns:
-            行程列表
-        """
-        return self.data["trip_history"][-limit:] if limit else self.data["trip_history"]
+        rows = self._execute(
+            """SELECT 'trip_' || id AS trip_id, created_at, origin, destination,
+                      start_date, end_date, purpose
+               FROM trip_history WHERE user_id = %s
+               ORDER BY id DESC LIMIT %s""",
+            (self.user_id, limit if limit else 1_000_000),
+        )
+        return [
+            {
+                "trip_id": r[0],
+                "timestamp": r[1].isoformat() if r[1] else "",
+                "origin": r[2], "destination": r[3],
+                "start_date": r[4], "end_date": r[5], "purpose": r[6],
+            }
+            for r in reversed(rows)
+        ]
 
     def get_frequent_destinations(self, top_n: int = 5) -> List[tuple]:
-        """
-        获取常去目的地
+        if self._pg is None:
+            freq = self.data["statistics"]["frequent_destinations"]
+            return sorted(freq.items(), key=lambda x: x[1], reverse=True)[:top_n]
 
-        Args:
-            top_n: 返回前N个
-
-        Returns:
-            [(destination, count), ...]
-        """
-        freq = self.data["statistics"]["frequent_destinations"]
-        sorted_dest = sorted(freq.items(), key=lambda x: x[1], reverse=True)
-        return sorted_dest[:top_n]
+        rows = self._execute(
+            """SELECT destination, COUNT(*) AS c FROM trip_history
+               WHERE user_id = %s AND destination IS NOT NULL AND destination <> ''
+               GROUP BY destination ORDER BY c DESC, destination ASC LIMIT %s""",
+            (self.user_id, top_n),
+        )
+        return [(r[0], r[1]) for r in rows]
 
     def increment_query_count(self):
-        """增加查询计数"""
-        self.data["statistics"]["total_queries"] += 1
-        self._save()
+        """修复：旧实现读 statistics["total_queries"]，但该 key 从未初始化 → 必然 KeyError"""
+        if self._pg is not None:
+            self._execute(
+                "UPDATE users SET query_count = query_count + 1, updated_at = now() "
+                "WHERE user_id = %s",
+                (self.user_id,), fetch=False,
+            )
+        else:
+            self.data["statistics"]["total_queries"] = (
+                self.data["statistics"].get("total_queries", 0) + 1
+            )
+            self._save()
+
+    def get_history_watermark(self) -> int:
+        """聊天记录版本号，供 LLM 总结缓存判断是否失效"""
+        if self._pg is not None:
+            return self._execute(
+                "SELECT COALESCE(MAX(id), 0) FROM chat_history WHERE user_id = %s",
+                (self.user_id,),
+            )[0][0]
+        return len(self.data.get("chat_history", []))
 
     def get_statistics(self) -> Dict[str, Any]:
-        """获取统计信息"""
-        return self.data["statistics"].copy()
+        if self._pg is None:
+            return self.data["statistics"].copy()
+
+        total_trips = self._execute(
+            "SELECT COUNT(*) FROM trip_history WHERE user_id = %s", (self.user_id,)
+        )[0][0]
+        total_messages = self._execute(
+            "SELECT COUNT(*) FROM chat_history WHERE user_id = %s", (self.user_id,)
+        )[0][0]
+        freq_rows = self._execute(
+            """SELECT destination, COUNT(*) FROM trip_history
+               WHERE user_id = %s AND destination IS NOT NULL AND destination <> ''
+               GROUP BY destination""",
+            (self.user_id,),
+        )
+        return {
+            "total_trips": total_trips,
+            "total_messages": total_messages,
+            "frequent_destinations": {r[0]: r[1] for r in freq_rows},
+        }
 
     def clear_history(self):
-        """清空历史记录（保留偏好）"""
-        self.data["chat_history"] = []
-        self.data["trip_history"] = []
-        self.data["statistics"]["total_trips"] = 0
-        self.data["statistics"]["total_messages"] = 0
-        self.data["statistics"]["frequent_destinations"] = {}
-        self._save()
-        logger.info("Cleared all history (chat + trips)")
+        if self._pg is not None:
+            self._execute("DELETE FROM chat_history WHERE user_id = %s", (self.user_id,), fetch=False)
+            self._execute("DELETE FROM trip_history  WHERE user_id = %s", (self.user_id,), fetch=False)
+        else:
+            self.data["chat_history"] = []
+            self.data["trip_history"] = []
+            self.data["statistics"].update(
+                {"total_trips": 0, "total_messages": 0, "frequent_destinations": {}}
+            )
+            self._save()
+
 
     def delete_all(self):
-        """删除所有数据（包括文件）"""
-        if os.path.exists(self.db_path):
+        if self._pg is not None:
+            # users 上的 ON DELETE CASCADE 会连带清掉偏好/聊天/行程
+            self._execute("DELETE FROM users WHERE user_id = %s", (self.user_id,), fetch=False)
+        elif os.path.exists(self.db_path):
             os.remove(self.db_path)
-            logger.warning(f"Deleted long-term memory file: {self.db_path}")

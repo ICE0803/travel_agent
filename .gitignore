@@ -18,6 +18,9 @@ build/
 # ⚠️ 含真实 API Key
 config.py
 
+# 个人简历文档
+*.pdf
+
 # 本地模型权重（91MB，很大）
 data/models/
 

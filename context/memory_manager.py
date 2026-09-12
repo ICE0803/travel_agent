@@ -1,21 +1,30 @@
 """
 记忆管理器 (Memory Manager)
 统一管理两层记忆，提供简单的API
+
+架构：
+- 短期记忆：Redis LIST（会话级滑动窗口，TTL 1 小时）
+- 长期记忆：PostgreSQL（跨会话持久化，含偏好 Write-Through 缓存）
+- LLM 总结缓存：Redis（TTL 30 分钟，带 watermark 版本号防止脏读）
 """
 from typing import Dict, Any, List, Optional
 from .short_term_memory import ShortTermMemory
 from .long_term_memory import LongTermMemory
+from .backends import get_redis
+from config import STORAGE_CONFIG
 import logging
 import json
 
 logger = logging.getLogger(__name__)
 
+SUMMARY_TTL = STORAGE_CONFIG.get("ttl", {}).get("summary", 1800)
+
 
 class MemoryManager:
     """
     记忆管理器：统一管理两层记忆
-    - 短期记忆：最近对话（会话级）
-    - 长期记忆：用户偏好和历史（跨会话）
+    - 短期记忆：最近对话（会话级，Redis）
+    - 长期记忆：用户偏好和历史（跨会话，PostgreSQL）
     """
 
     def __init__(self, user_id: str, session_id: str, storage_path: str = "data/memory", llm_model=None):
@@ -25,7 +34,7 @@ class MemoryManager:
         Args:
             user_id: 用户ID
             session_id: 会话ID
-            storage_path: 长期记忆存储路径
+            storage_path: 长期记忆存储路径（仅 JSON 降级模式使用）
             llm_model: LLM模型实例（用于总结长期记忆）
         """
         self.user_id = user_id
@@ -33,10 +42,26 @@ class MemoryManager:
         self.llm_model = llm_model
 
         # 初始化两层记忆
-        self.short_term = ShortTermMemory(max_turns=10)
+        # 注意：session_id 必须传进去，否则所有会话会共用同一个 Redis key
+        self.short_term = ShortTermMemory(max_turns=10, session_id=session_id)
         self.long_term = LongTermMemory(user_id, storage_path)
 
-        logger.info(f"Memory manager initialized for user {user_id}, session {session_id}")
+        # LLM 总结缓存
+        self._redis = get_redis()
+        self._sum_key = f"user:{user_id}:summary"
+        self.sum_hit_key = f"{self._sum_key}:hit"
+        self.sum_miss_key = f"{self._sum_key}:miss"
+
+        if self._redis is not None:
+            logger.info(
+                "Memory manager initialized for user %s, session %s (redis cache on)",
+                user_id, session_id,
+            )
+        else:
+            logger.info(
+                "Memory manager initialized for user %s, session %s (redis cache off)",
+                user_id, session_id,
+            )
 
     # ========== 短期记忆操作 ==========
 
@@ -49,10 +74,10 @@ class MemoryManager:
             content: 消息内容
             metadata: 元数据
         """
-        # 添加到短期记忆（当前会话）
+        # 添加到短期记忆（当前会话，Redis）
         self.short_term.add_message(role, content, metadata)
 
-        # 同时添加到长期记忆（跨会话持久化）
+        # 同时添加到长期记忆（跨会话持久化，PostgreSQL）
         self.long_term.add_chat_message(role, content, self.session_id)
 
     # ========== 长期记忆操作 ==========
@@ -100,7 +125,7 @@ class MemoryManager:
             lines.append(long_term_summary)
             lines.append("")
 
-        # 用户偏好
+        # 用户偏好（走 Redis 缓存）
         prefs = self.long_term.get_preference()
         has_prefs = any(v for v in prefs.values() if v)
         if has_prefs:
@@ -122,13 +147,122 @@ class MemoryManager:
     # ========== 会话管理 ==========
 
     def end_session(self):
-        """结束会话"""
+        """结束会话（只清短期记忆，长期记忆保留）"""
         self.short_term.clear()
         logger.info(f"Session ended: {self.session_id}")
 
+    # ========== 缓存统计 ==========
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """
+        获取缓存命中率统计（用于 status 命令展示）
+
+        Returns:
+            {"enabled": bool, "preferences": {...}, "summary": {...}}
+        """
+        if self._redis is None:
+            return {"enabled": False}
+
+        def _pair(hit_key: str, miss_key: str) -> Dict[str, Any]:
+            try:
+                hit = int(self._redis.get(hit_key) or 0)
+                miss = int(self._redis.get(miss_key) or 0)
+            except Exception as e:
+                logger.warning("读取缓存计数失败: %s", e)
+                hit = miss = 0
+            total = hit + miss
+            return {
+                "hit": hit,
+                "miss": miss,
+                "total": total,
+                "rate": round(hit / total * 100, 1) if total else 0.0,
+            }
+
+        # 偏好缓存的计数键由 LongTermMemory 维护，这里按同一约定拼接
+        pref_hit = getattr(self.long_term, "pref_hit_key", f"user:{self.user_id}:prefs:hit")
+        pref_miss = getattr(self.long_term, "pref_miss_key", f"user:{self.user_id}:prefs:miss")
+
+        return {
+            "enabled": True,
+            "preferences": _pair(pref_hit, pref_miss),
+            "summary": _pair(self.sum_hit_key, self.sum_miss_key),
+        }
+
+    # ========== LLM 总结（带 Redis 缓存） ==========
+
     async def get_long_term_summary_async(self, max_messages: int = 50) -> str:
         """
-        使用LLM总结长期聊天历史（异步版本）
+        使用LLM总结长期聊天历史（异步版本，带 Redis 缓存）
+
+        缓存策略：
+        - key: user:{user_id}:summary
+        - value: {"watermark": <chat_history 当前最大 id>, "summary": "..."}
+        - 读取时比对 watermark，不一致说明有新消息 → 缓存失效，重新生成
+          这样解决"用户刚说完新偏好，总结还是旧的"的脏读问题
+        - TTL 由 STORAGE_CONFIG["ttl"]["summary"] 控制（默认 30 分钟）
+
+        Args:
+            max_messages: 最多总结的消息数量
+
+        Returns:
+            总结后的文本
+        """
+        if not self.llm_model:
+            return ""
+
+        watermark = self._get_history_watermark()
+
+        # 1) 尝试读缓存
+        if self._redis is not None and watermark is not None:
+            try:
+                raw = self._redis.get(self._sum_key)
+                if raw is not None:
+                    payload = json.loads(raw)
+                    if payload.get("watermark") == watermark:
+                        self._redis.incr(self.sum_hit_key)
+                        logger.debug("长期记忆总结命中缓存 (watermark=%s)", watermark)
+                        return payload.get("summary", "")
+                self._redis.incr(self.sum_miss_key)
+            except Exception as e:
+                logger.warning("总结缓存读取失败，直接重新生成: %s", e)
+
+        # 2) 未命中 → 调 LLM 生成
+        summary = await self._generate_summary(max_messages)
+
+        # 3) 回填缓存（只缓存成功且非空的结果，避免把 LLM 失败也缓存 30 分钟）
+        if summary and self._redis is not None and watermark is not None:
+            try:
+                self._redis.setex(
+                    self._sum_key,
+                    SUMMARY_TTL,
+                    json.dumps(
+                        {"watermark": watermark, "summary": summary},
+                        ensure_ascii=False,
+                    ),
+                )
+                logger.debug("长期记忆总结已写入缓存 (TTL=%ss)", SUMMARY_TTL)
+            except Exception as e:
+                logger.warning("总结缓存写入失败: %s", e)
+
+        return summary
+
+    def _get_history_watermark(self) -> Optional[int]:
+        """
+        取当前用户聊天记录的版本号（chat_history 的最大 id）
+        用于判断总结缓存是否已失效
+        """
+        getter = getattr(self.long_term, "get_history_watermark", None)
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except Exception as e:
+            logger.warning("获取 history watermark 失败: %s", e)
+            return None
+
+    async def _generate_summary(self, max_messages: int = 50) -> str:
+        """
+        真正调用 LLM 生成长期记忆总结（无缓存）
 
         Args:
             max_messages: 最多总结的消息数量

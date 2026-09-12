@@ -58,6 +58,7 @@ class RAGKnowledgeAgent(AgentBase):
         collection_name: str = "business_travel_knowledge",
         embedding_model: str = "BAAI/bge-small-zh-v1.5",
         top_k: int = 3,
+        similarity_threshold: float = None,
         **kwargs
     ):
         super().__init__()
@@ -74,6 +75,15 @@ class RAGKnowledgeAgent(AgentBase):
         self.top_k = top_k
         from utils.skill_loader import SkillLoader
         self.skill_loader = SkillLoader()
+
+        if similarity_threshold is None:
+            try:
+                from config import RAG_CONFIG
+                similarity_threshold = RAG_CONFIG.get("similarity_threshold", 0.5)
+            except Exception:
+                similarity_threshold = 0.5
+        self.similarity_threshold = similarity_threshold
+        logger.info(f"相似度阈值: {self.similarity_threshold}")
 
         if not DEPENDENCIES_AVAILABLE:
             logger.error("RAG dependencies not installed. Install with: pip install pymilvus sentence-transformers")
@@ -263,6 +273,27 @@ class RAGKnowledgeAgent(AgentBase):
                         'distance': hit.get("distance", 0.0)
                     })
 
+
+            if self.similarity_threshold is not None and retrieved_docs:
+                raw_count = len(retrieved_docs)
+                top_score = max(float(d.get("distance", 0.0)) for d in retrieved_docs)
+                kept = [
+                    d for d in retrieved_docs
+                    if float(d.get("distance", 0.0)) >= self.similarity_threshold
+                ]
+                if len(kept) < raw_count:
+                    logger.info(
+                        "相似度过滤：丢弃 %d/%d 条（阈值 %.2f，本次最高分 %.4f）",
+                        raw_count - len(kept), raw_count,
+                        self.similarity_threshold, top_score,
+                    )
+                retrieved_docs = kept
+
+            if not retrieved_docs:
+                logger.info(
+                    "无满足阈值的知识片段（query=%s，阈值=%.2f）",
+                    query[:50], self.similarity_threshold,
+                )
             logger.info(f"Retrieved {len(retrieved_docs)} documents for query: {query[:50]}")
             return retrieved_docs
 

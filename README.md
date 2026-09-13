@@ -49,31 +49,29 @@
 ```
 用户输入
    ↓
-┌──────────────────────────────────────────────────────────┐
-│  IntentionAgent (意图识别)                                │
-│  - 语义理解意图（非关键词匹配）                               │
-│  - 识别关键实体 / 生成调度计划 / 确定优先级                    │
-│  - 动态加载 Skills 元数据 (Progressive Disclosure)          │
-└──────────────────────────────────────────────────────────┘
+┌─ IntentionAgent（意图识别） ───────────────────────────────────┐
+│ · 语义理解意图（非关键词匹配）                                 │
+│ · 识别关键实体 / 生成调度计划 / 确定优先级                     │
+│ · 动态加载 Skills 元数据（Progressive Disclosure）             │
+└────────────────────────────────────────────────────────────────┘
    ↓
-┌──────────────────────────────────────────────────────────┐
-│  OrchestrationAgent (协调器)                              │
-│  - 按优先级调度 / 同优先级并行                               │
-│  - 管理 Agent 间消息传递 / 集成两层记忆                      │
-│  - 动态实例化 Skills (LazyAgentRegistry)                   │
-└──────────────────────────────────────────────────────────┘
+┌─ OrchestrationAgent（协调器） ─────────────────────────────────┐
+│ · 按优先级调度 / 同优先级并行                                     │
+│ · 管理 Agent 间消息传递 / 集成两层记忆                            │
+│ · 动态实例化 Skills（LazyAgentRegistry）                        │
+└───────────────────────────────────────────────────────────────┘
    ↓
-┌─────────────  Priority 1 (并行执行，信息收集)   ─────────────┐
-│  MemoryQuery  记忆查询      .claude/skills/memory-query    │
-│  EventCollection 事项收集   .claude/skills/event-collection│
-│  Preference   偏好管理      .claude/skills/preference      │
-│  InformationQuery 信息查询  .claude/skills/query-info      │
-│  RAGKnowledgeAgent 知识问答 .claude/skills/ask-question    │
-└──────────────────────────────┬────────────────────────────┘
+┌─   Priority 1（并行执行，信息收集） ─────────────────────────────┐
+│ MemoryQuery        记忆查询    .claude/skills/memory-query     │
+│ EventCollection    事项收集    .claude/skills/event-collection │
+│ Preference         偏好管理    .claude/skills/preference       │
+│ InformationQuery   信息查询    .claude/skills/query-info       │
+│ RAGKnowledgeAgent  知识问答    .claude/skills/ask-question     │
+└───────────────────────────────────────────────────────────────┘
    ↓
-┌───────────── Priority 2 (依赖 P1 结果，串行)   ─────────────┐
-│  ItineraryPlanningAgent 行程规划  .claude/skills/plan-trip │
-└──────────────────────────────┬────────────────────────────┘
+┌─   Priority 2（依赖 P1 结果，串行） ─────────────────────────────┐
+│ ItineraryPlanningAgent  行程规划  .claude/skills/plan-trip     │
+└───────────────────────────────────────────────────────────────┘
    ↓
 [结果聚合 + 记忆回写 + 生成人性化回复]
    ↓
@@ -155,65 +153,30 @@
 
 ### 3. RAG 知识库
 
-- **向量数据库**：Milvus Lite（本地 `.db`）
-- **Embedding**：`bge-small-zh-v1.5`（本地部署，`data/models/bge-small-zh-v1.5/`）
-- **文档处理**：分块 + **混合检索**（Top-K=3）
-- **相似度阈值过滤**：低于 `RAG_CONFIG.similarity_threshold`（默认 0.5）的召回片段直接丢弃，数量归零时明确回答「知识库中没有找到相关信息」
-- **四层防幻觉**：Prompt 强约束 → RAG 知识增强 → 相似度阈值过滤 → 文档溯源
-- **可追溯性**：返回文档来源（类别、标题、源文档路径），支持知识溯源
-- **知识内容（12 类）**：差旅规定、报销、预订指南、FAQ、应急处理、平台指南、城市指南、环保倡议、**会员权益、国际差旅、景点指南、特殊时期政策**
+- **存储与向量化**：Milvus Lite（本地 `.db`）+ `bge-small-zh-v1.5` 中文 Embedding（本地部署 `data/models/`）
+- **文档处理**：按段落分块（每块 ≤600 字符）+ **混合检索**（Top-K=3）
+- **四层防幻觉**：Prompt 强约束 → 知识增强 → 相似度阈值过滤（默认 0.5；不达标直接丢弃，数量归零时明确回答「知识库中没有相关信息」）→ 文档溯源
+- **知识内容（12 类）**：差旅规定、报销、预订指南、FAQ、应急处理、平台指南、城市指南、环保倡议、会员权益、国际差旅、景点指南、特殊时期政策
 
 #### 混合检索（BM25 + 向量 + RRF）
 
-**为什么需要**：纯向量检索擅长语义匹配，但对**关键词精确匹配**不敏感。用户问「报销标准是多少」，向量检索可能召回语义相近但不含「报销标准」字样的段落；反过来，关键词查准则容易漏掉换个说法的同义表达。两路互补。
-
-**检索流程**：
+纯向量擅长语义匹配，但对**关键词精确匹配**不敏感——用户问「报销标准」，可能召回意思相近却不含这个词的段落；BM25 正好互补。两路召回后用 RRF 融合：
 
 ```
 用户 query
-   ├─ 向量路：bge-small-zh-v1.5 编码 → Milvus COSINE 检索 → top_k_dense=10
+   ├─ 向量路：bge-small-zh-v1.5 → Milvus COSINE → top_k_dense=10
    │            └─ similarity_threshold=0.5 过滤（只作用于这一路）
-   └─ BM25 路：jieba 分词 → Okapi BM25 打分 → top_k_sparse=10
-                └─ min_bm25_score 准入过滤
+   └─ BM25 路：jieba 分词 → Okapi BM25 → top_k_sparse=10
                         ↓
               RRF 融合（k=60）→ 取 final_top_k=3
 ```
 
-**为什么用 RRF 而不是加权求和**：BM25 分数无上界（取决于 IDF 量纲），余弦相似度在 -1~1，两者**量纲不同**，直接加权需要归一化，而归一化方式本身又要调参。RRF 只看**排名**不看分数：
+用 RRF 而非加权求和：BM25 分数无上界、余弦在 -1~1，**量纲不同**无法直接加权；RRF 只看排名（`RRF(d) = Σ 1/(k + rank)`），天然规避该问题。
 
-```
-RRF(d) = Σ_i  1 / (k + rank_i(d))          k 取原论文经验值 60
-```
+> ⚠️ 一个容易踩的坑：`similarity_threshold=0.5` 是给**余弦分数**用的，而 RRF 分数只有 `0.008~0.03` 量级。
+> 直接套用会**把所有结果过滤光**，系统永远回答「知识库中没有相关信息」。所以阈值只作用于向量路，BM25 单路命中走独立的 `min_bm25_score`。
 
-天然规避量纲问题，且对异常分数鲁棒。
-
-**关键实现细节（容易踩的坑）**：
-
-> `similarity_threshold=0.5` 是给**余弦分数**用的，而 RRF 分数只有 `1/(60+rank) ≈ 0.008~0.03` 量级。
-> 如果把 0.5 直接套到 RRF 分数上，**所有结果都会被过滤光**，系统会永远回答"知识库中没有相关信息"。
-> 因此：阈值**只作用于向量路**，BM25 单路命中走独立的 `min_bm25_score` 准入。
-
-**分词**：优先 **jieba**（`lcut_for_search` 搜索引擎模式，长词额外切出子词提升召回）；jieba 未安装时自动降级为**字符二元组**（`差旅标准 → 差旅/旅标/标准`），保证模块在无 jieba 环境下仍可用。
-另带**停用词过滤**——BM25 的 IDF 用了 `ln(1+...)` 平滑恒为正，导致「的/是/在/如何」这类在所有文档中都出现的虚词仍会贡献分数，小语料下噪声会压过实词。实测开启停用词过滤后 **Hit@1 从 4/12 提升到 7/12**。
-
-**配置**（`config.py` → `RAG_CONFIG["hybrid"]`）：
-
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `enabled` | `true` | 设为 `false` 退回纯向量检索（用于 A/B 对比与回归排查） |
-| `top_k_dense` | 10 | 向量路召回条数 |
-| `top_k_sparse` | 10 | BM25 路召回条数 |
-| `rrf_k` | 60 | RRF 公式里的 k，越大排名差异被压得越平 |
-| `final_top_k` | 3 | 融合后最终返回条数 |
-| `bm25_k1` | 1.5 | 词频饱和系数（一个词出现 10 次不比 3 次重要 3 倍） |
-| `bm25_b` | 0.75 | 文档长度归一化（惩罚长文档天然易命中） |
-| `min_bm25_score` | 0.5 | BM25 单路命中的准入阈值，**需按语料调优** |
-
-**检索结果新增字段**：`matched_by`（`vector` / `bm25` / `vector+bm25`，标明该条由哪路召回）与 `rrf_score`（融合得分）。仅 BM25 命中的条目 `distance` 为 `null`。
-
-**模块**：`utils/hybrid_retriever.py`（`tokenize` / `BM25Index` / `reciprocal_rank_fusion`），零外部强依赖，可离线单测。
-
-**实测效果**（`scripts/eval_retrieval.py`，53 条标注 query + 6 条负例，Top-3）：
+**实测**（`scripts/eval_retrieval.py`，53 条标注 query + 6 条负例，Top-3）：
 
 | 检索模式 | Hit@1 | Hit@3 | MRR |
 |---|---|---|---|
@@ -221,10 +184,7 @@ RRF(d) = Σ_i  1 / (k + rank_i(d))          k 取原论文经验值 60
 | 纯 BM25 | 46/53 | 53/53 | 0.928 |
 | **混合（RRF）** | **49/53** | **53/53** | **0.959** |
 
-混合检索在三项指标上均为最优：相对纯向量 **Hit@3 从 48 提升到 53（补齐全部漏召）**，MRR 0.865 → 0.959。其中 5 条是纯向量完全召不回、靠 BM25 关键词路补上的。
-
-> 值得注意：本项目语料的查询偏**术语密集型**，所以纯 BM25 反而强于纯向量（Hit@1 46 vs 44）；混合检索把两路优势都拿到了。
-> 复现：`venv\Scripts\python.exe scripts\eval_retrieval.py`
+混合检索三项指标均最优，Hit@3 相对纯向量补齐全部漏召。分词优先 jieba（未装则降级字符二元组）+ 停用词过滤；参数见 `config.py` → `RAG_CONFIG["hybrid"]`，实现见 `utils/hybrid_retriever.py`。
 
 ### 4. 信息查询（联网搜索）
 
@@ -507,12 +467,7 @@ travel_agent/
 - 若使用 `pymilvus 3.x`，需在 `search_knowledge()` 中先调用 `load_collection()` 再检索（代码已处理）
 
 ### 网络搜索配置（多后端可插拔）
-- 后端由 `config.py` 的 `SEARCH_CONFIG` 控制：
-  ```python
-  "backend": "auto",                    # auto | tavily | ddgs
-  "auto_order": ["tavily", "ddgs"],     # auto 模式下的尝试顺序
-  ```
-  `auto` 会依次尝试，任一成功即用；某个后端未配置 / 超时 / 配额用尽 / 返回 0 条，都会自动换下一个。
+- 后端由 `config.py` 的 `SEARCH_CONFIG` 控制：`backend` 可选 `auto | tavily | ddgs`，`auto_order` 决定尝试顺序。`auto` 会依次尝试、任一成功即用；未配置 / 超时 / 配额用尽 / 返回 0 条都会自动换下一个。
 - **后端对比**：
 
   | 后端 | 凭据 | 免费额度 | 说明 |
@@ -520,27 +475,13 @@ travel_agent/
   | **Tavily** ⭐ | `TAVILY_API_KEY` | 1000 credits/月 | **主通道**。返回抽取好的正文，适合 RAG；控制台 <https://app.tavily.com> |
   | DDGS | 无需 Key | 无限制 | 兜底通道。抓取公开页面，零配置；实测部分后端已失效，较脆弱 |
 
-- **填 Key 推荐直接写进 `config.py`**（`config.py` 已被 `.gitignore` 忽略，Key 不会进仓库）：
+- **Key 直接写进 `config.py`**（该文件已被 `.gitignore` 忽略，Key 不会进仓库）：
   ```python
-  SEARCH_CONFIG = {
-      "tavily": {"api_key": "tvly-你的Key", ...},
-      ...
-  }
+  SEARCH_CONFIG = {"tavily": {"api_key": "tvly-你的Key", ...}}
   ```
-  > ⚠️ 也可以用环境变量 `setx TAVILY_API_KEY "tvly-你的Key"`，但要注意 **Windows 的坑**：
-  > `setx` 不会注入**已运行**的进程。若终端继承自已运行的父进程（Windows Terminal / VS Code /
-  > 资源管理器未刷新），**重开标签页甚至重开窗口都可能仍读不到**，表现为「明明设置了，程序却说未配置」。
-  > 遇到这种情况，最省事的办法就是回到上面直接写进 `config.py`。
-- **自检与排错**：
-  ```powershell
-  venv\Scripts\python.exe scripts\check_search_api.py          # 逐后端实测（Tavily/DDGS）
-  venv\Scripts\python.exe scripts\check_search_api.py tavily   # 只测 Tavily
-  venv\Scripts\python.exe scripts\eval_retrieval.py            # 检索效果评测（纯向量 vs 纯BM25 vs 混合）
-  venv\Scripts\python.exe tests\test_search_backend.py         # 离线验证回退编排（32 项）
-  venv\Scripts\python.exe tests\test_hybrid_retriever.py       # 离线验证混合检索算法（30 项）
-  ```
-  诊断脚本会自动识别「环境变量已在注册表但当前进程读不到」这种情况，并打印注册表里的值和解法。
-- 返回结果的 `results.engine` 标明本次实际使用的后端；若前面有后端失败但最终成功，`results.fallback` 记录失败原因（避免静默降级无人察觉）；全部失败时 `results.attempts` 列出每个后端的原因。
+  > 也可用环境变量 `setx TAVILY_API_KEY "..."`，但 **Windows 下 `setx` 不会注入已运行的进程**——终端若继承自旧父进程（Windows Terminal / VS Code），重开标签页甚至重开窗口都可能仍读不到，表现为「明明设置了，程序却说未配置」。遇到就回到上面写进 `config.py`。
+- **自检**：`scripts/check_search_api.py`（逐后端实测）、`scripts/eval_retrieval.py`（检索效果评测），以及 `tests/` 下两份离线测试（`test_search_backend` / `test_hybrid_retriever`，均不需要网络与 Key）。诊断脚本会自动识别「环境变量已在注册表但当前进程读不到」并给出解法。
+- 返回结果的 `results.engine` 标明实际使用的后端；回退时 `results.fallback` 记录原因（避免静默降级无人察觉），全部失败时 `results.attempts` 列出各后端原因。
 
 ---
 
@@ -552,7 +493,6 @@ travel_agent/
 - [x] ~~多路召回（向量 + BM25 混合检索）~~（已完成：`utils/hybrid_retriever.py` + RRF 融合）
 - [ ] Rerank 精排（在 RRF 融合后接一个 Cross-Encoder 重排，进一步提升精度）
 - [x] ~~检索效果评测脚本~~（已完成：`scripts/eval_retrieval.py`，36 条标注 query + 6 条负例，输出 Hit@k / MRR 对比报告）
-- [ ] BM25 单路准入改用「至少命中 N 个查询实词」—— 实测正例 BM25 最高分 5.85~21.51、负例 3.30~10.41，**区间重叠，绝对分数阈值无法分开**（根因：IDF 的 `ln(1+...)` 平滑恒为正，小语料下稀有词命中会拿高分）
 - [ ] 支持更多 LLM / 切换模型
 - [ ] Web 界面（FastAPI + React）
 - [ ] 更多 Skill 插件（酒店预订、机票查询等）

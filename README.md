@@ -50,28 +50,28 @@
 用户输入
    ↓
 ┌──────────────────────────────────────────────────────────┐
-│  IntentionAgent (意图识别)                                 │
-│  - 语义理解意图（非关键词匹配）                            │
-│  - 识别关键实体 / 生成调度计划 / 确定优先级               │
-│  - 动态加载 Skills 元数据 (Progressive Disclosure)        │
+│  IntentionAgent (意图识别)                                │
+│  - 语义理解意图（非关键词匹配）                               │
+│  - 识别关键实体 / 生成调度计划 / 确定优先级                    │
+│  - 动态加载 Skills 元数据 (Progressive Disclosure)          │
 └──────────────────────────────────────────────────────────┘
    ↓
 ┌──────────────────────────────────────────────────────────┐
 │  OrchestrationAgent (协调器)                              │
-│  - 按优先级调度 / 同优先级并行                            │
-│  - 管理 Agent 间消息传递 / 集成两层记忆                    │
-│  - 动态实例化 Skills (LazyAgentRegistry)                  │
+│  - 按优先级调度 / 同优先级并行                               │
+│  - 管理 Agent 间消息传递 / 集成两层记忆                      │
+│  - 动态实例化 Skills (LazyAgentRegistry)                   │
 └──────────────────────────────────────────────────────────┘
    ↓
-┌───────────── Priority 1 (并行执行，信息收集) ─────────────┐
-│  MemoryQuery  记忆查询      .claude/skills/memory-query   │
+┌─────────────  Priority 1 (并行执行，信息收集)   ─────────────┐
+│  MemoryQuery  记忆查询      .claude/skills/memory-query    │
 │  EventCollection 事项收集   .claude/skills/event-collection│
 │  Preference   偏好管理      .claude/skills/preference      │
 │  InformationQuery 信息查询  .claude/skills/query-info      │
 │  RAGKnowledgeAgent 知识问答 .claude/skills/ask-question    │
 └──────────────────────────────┬────────────────────────────┘
    ↓
-┌───────────── Priority 2 (依赖 P1 结果，串行) ─────────────┐
+┌───────────── Priority 2 (依赖 P1 结果，串行)   ─────────────┐
 │  ItineraryPlanningAgent 行程规划  .claude/skills/plan-trip │
 └──────────────────────────────┬────────────────────────────┘
    ↓

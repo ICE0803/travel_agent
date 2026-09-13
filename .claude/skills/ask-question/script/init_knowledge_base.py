@@ -99,6 +99,7 @@ def load_documents_from_directory(directory_path: str) -> List[Dict]:
         return documents
 
     # 定义类别映射（根据文件名判断）
+    # 注意：匹配逻辑是 `key in doc_key`，新增 key 时注意不要与已有 key 互为子串
     category_mapping = {
         "travel_standards": "差旅规定",
         "reimbursement_policy": "报销规定",
@@ -107,7 +108,12 @@ def load_documents_from_directory(directory_path: str) -> List[Dict]:
         "emergency_procedures": "应急指南",
         "platform_guide": "平台指南",
         "city_specific_tips": "城市指南",
-        "environmental_initiatives": "环保倡议"
+        "environmental_initiatives": "环保倡议",
+        # --- 后补文档 ---
+        "member_benefits": "会员权益",
+        "international_travel": "国际差旅",
+        "city_attractions": "景点指南",
+        "seasonal_policies": "特殊时期政策",
     }
 
     total_chunks = 0

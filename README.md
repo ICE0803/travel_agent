@@ -22,8 +22,9 @@
 ### 📚 RAG 知识库
 - **Milvus Lite** 向量数据库（本地 `.db`）+ **bge-small-zh-v1.5** 中文 Embedding 模型（本地部署 `data/models/`）
 - **文档分块（Chunking）**：长文档按段落切分（默认每块 ≤600 字符、重叠 100 字符）
+- **混合检索（Hybrid Retrieval）**：**向量（语义）+ BM25（关键词）双路召回 → RRF 融合**。解决纯向量检索的短板——用户问「报销标准」时，语义检索可能召回意思相近但不含这个词的段落；BM25 路专门补这类关键词精确匹配
 - **余弦相似度检索**（Top-K=3）+ **相似度阈值过滤** + **文档溯源**：低于阈值（默认 0.5）的召回片段直接丢弃，知识库无相关内容时明确回答「找不到」而不是让模型硬编；返回 `metadata`（类别、标题、来源、原文档路径），保证可追溯、可验证
-- 知识来源：差旅规定、报销、预订指南、FAQ、应急处理、平台指南、城市指南、环保倡议 8 类文档
+- 知识来源：**12 类文档 / 90 个 chunk** —— 差旅规定、报销、预订指南、FAQ、应急处理、平台指南、城市指南、环保倡议、会员权益、国际差旅、景点指南、特殊时期政策
 
 ### ⚡ 优先级并行调度
 - **Plan-and-Execute**：`IntentionAgent`（规划）→ `OrchestrationAgent`（调度）→ 子 Agent（执行）
@@ -156,11 +157,74 @@
 
 - **向量数据库**：Milvus Lite（本地 `.db`）
 - **Embedding**：`bge-small-zh-v1.5`（本地部署，`data/models/bge-small-zh-v1.5/`）
-- **文档处理**：分块 + 余弦相似度检索（Top-K=3）
+- **文档处理**：分块 + **混合检索**（Top-K=3）
 - **相似度阈值过滤**：低于 `RAG_CONFIG.similarity_threshold`（默认 0.5）的召回片段直接丢弃，数量归零时明确回答「知识库中没有找到相关信息」
 - **四层防幻觉**：Prompt 强约束 → RAG 知识增强 → 相似度阈值过滤 → 文档溯源
 - **可追溯性**：返回文档来源（类别、标题、源文档路径），支持知识溯源
-- **知识内容（8 类）**：差旅规定、报销、预订指南、FAQ、应急处理、平台指南、城市指南、环保倡议
+- **知识内容（12 类）**：差旅规定、报销、预订指南、FAQ、应急处理、平台指南、城市指南、环保倡议、**会员权益、国际差旅、景点指南、特殊时期政策**
+
+#### 混合检索（BM25 + 向量 + RRF）
+
+**为什么需要**：纯向量检索擅长语义匹配，但对**关键词精确匹配**不敏感。用户问「报销标准是多少」，向量检索可能召回语义相近但不含「报销标准」字样的段落；反过来，关键词查准则容易漏掉换个说法的同义表达。两路互补。
+
+**检索流程**：
+
+```
+用户 query
+   ├─ 向量路：bge-small-zh-v1.5 编码 → Milvus COSINE 检索 → top_k_dense=10
+   │            └─ similarity_threshold=0.5 过滤（只作用于这一路）
+   └─ BM25 路：jieba 分词 → Okapi BM25 打分 → top_k_sparse=10
+                └─ min_bm25_score 准入过滤
+                        ↓
+              RRF 融合（k=60）→ 取 final_top_k=3
+```
+
+**为什么用 RRF 而不是加权求和**：BM25 分数无上界（取决于 IDF 量纲），余弦相似度在 -1~1，两者**量纲不同**，直接加权需要归一化，而归一化方式本身又要调参。RRF 只看**排名**不看分数：
+
+```
+RRF(d) = Σ_i  1 / (k + rank_i(d))          k 取原论文经验值 60
+```
+
+天然规避量纲问题，且对异常分数鲁棒。
+
+**关键实现细节（容易踩的坑）**：
+
+> `similarity_threshold=0.5` 是给**余弦分数**用的，而 RRF 分数只有 `1/(60+rank) ≈ 0.008~0.03` 量级。
+> 如果把 0.5 直接套到 RRF 分数上，**所有结果都会被过滤光**，系统会永远回答"知识库中没有相关信息"。
+> 因此：阈值**只作用于向量路**，BM25 单路命中走独立的 `min_bm25_score` 准入。
+
+**分词**：优先 **jieba**（`lcut_for_search` 搜索引擎模式，长词额外切出子词提升召回）；jieba 未安装时自动降级为**字符二元组**（`差旅标准 → 差旅/旅标/标准`），保证模块在无 jieba 环境下仍可用。
+另带**停用词过滤**——BM25 的 IDF 用了 `ln(1+...)` 平滑恒为正，导致「的/是/在/如何」这类在所有文档中都出现的虚词仍会贡献分数，小语料下噪声会压过实词。实测开启停用词过滤后 **Hit@1 从 4/12 提升到 7/12**。
+
+**配置**（`config.py` → `RAG_CONFIG["hybrid"]`）：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `enabled` | `true` | 设为 `false` 退回纯向量检索（用于 A/B 对比与回归排查） |
+| `top_k_dense` | 10 | 向量路召回条数 |
+| `top_k_sparse` | 10 | BM25 路召回条数 |
+| `rrf_k` | 60 | RRF 公式里的 k，越大排名差异被压得越平 |
+| `final_top_k` | 3 | 融合后最终返回条数 |
+| `bm25_k1` | 1.5 | 词频饱和系数（一个词出现 10 次不比 3 次重要 3 倍） |
+| `bm25_b` | 0.75 | 文档长度归一化（惩罚长文档天然易命中） |
+| `min_bm25_score` | 0.5 | BM25 单路命中的准入阈值，**需按语料调优** |
+
+**检索结果新增字段**：`matched_by`（`vector` / `bm25` / `vector+bm25`，标明该条由哪路召回）与 `rrf_score`（融合得分）。仅 BM25 命中的条目 `distance` 为 `null`。
+
+**模块**：`utils/hybrid_retriever.py`（`tokenize` / `BM25Index` / `reciprocal_rank_fusion`），零外部强依赖，可离线单测。
+
+**实测效果**（`scripts/eval_retrieval.py`，53 条标注 query + 6 条负例，Top-3）：
+
+| 检索模式 | Hit@1 | Hit@3 | MRR |
+|---|---|---|---|
+| 纯向量 | 44/53 | 48/53 | 0.865 |
+| 纯 BM25 | 46/53 | 53/53 | 0.928 |
+| **混合（RRF）** | **49/53** | **53/53** | **0.959** |
+
+混合检索在三项指标上均为最优：相对纯向量 **Hit@3 从 48 提升到 53（补齐全部漏召）**，MRR 0.865 → 0.959。其中 5 条是纯向量完全召不回、靠 BM25 关键词路补上的。
+
+> 值得注意：本项目语料的查询偏**术语密集型**，所以纯 BM25 反而强于纯向量（Hit@1 46 vs 44）；混合检索把两路优势都拿到了。
+> 复现：`venv\Scripts\python.exe scripts\eval_retrieval.py`
 
 ### 4. 信息查询（联网搜索）
 
@@ -315,10 +379,16 @@ python tests/test_cli_qa.py
 
 ### 单元 / 模块测试
 ```bash
+python tests/test_hybrid_retriever.py   # 混合检索（分词/停用词/BM25/RRF，离线可跑）
+python tests/test_search_backend.py     # 网络搜索后端回退编排（离线可跑）
 python tests/test_memory_system.py      # 记忆系统
 python tests/test_intention_agent.py    # 意图识别
 python tests/test_information_query_agent.py  # 信息查询（天气/搜索，需联网）
 ```
+
+> `test_hybrid_retriever.py` 与 `test_search_backend.py` **不依赖网络、Milvus 和 API Key**，
+> 可直接在 CI 里跑。前者在 jieba 装了或没装的环境下都能通过（分词用例按后端分支断言，
+> 并额外强制走一遍 bigram 降级路径）。
 
 ---
 
@@ -334,7 +404,7 @@ travel_agent/
 │   ├── ask-question/                # 知识库问答 (RAG)
 │   │   ├── script/agent.py
 │   │   ├── script/init_knowledge_base.py
-│   │   ├── data/documents/          # 8 类知识源文档
+│   │   ├── data/documents/          # 12 类知识源文档（90 chunk）
 │   │   └── SKILL.md
 │   ├── event-collection/            # 事项收集
 │   ├── plan-trip/                   # 行程规划
@@ -385,7 +455,10 @@ travel_agent/
 ### 向量化与检索
 - 🧠 **bge-small-zh-v1.5** - 中文 Embedding 模型（本地部署）
 - 📚 **Sentence-Transformers** - 向量化工具库
-- 🎯 **余弦相似度检索** - Top-K 检索算法
+- 🎯 **余弦相似度检索** - 语义路 Top-K 检索
+- 🔤 **jieba** - 中文分词（BM25 关键词路；未安装时降级为字符二元组）
+- 📊 **Okapi BM25** - 关键词路打分（`k1=1.5, b=0.75`）
+- 🔀 **RRF（Reciprocal Rank Fusion）** - 双路融合排序（`k=60`）
 
 ### 联网与搜索
 - 🌐 **wttr.in** - 天气查询（免费）
@@ -462,7 +535,9 @@ travel_agent/
   ```powershell
   venv\Scripts\python.exe scripts\check_search_api.py          # 逐后端实测（Tavily/DDGS）
   venv\Scripts\python.exe scripts\check_search_api.py tavily   # 只测 Tavily
+  venv\Scripts\python.exe scripts\eval_retrieval.py            # 检索效果评测（纯向量 vs 纯BM25 vs 混合）
   venv\Scripts\python.exe tests\test_search_backend.py         # 离线验证回退编排（32 项）
+  venv\Scripts\python.exe tests\test_hybrid_retriever.py       # 离线验证混合检索算法（30 项）
   ```
   诊断脚本会自动识别「环境变量已在注册表但当前进程读不到」这种情况，并打印注册表里的值和解法。
 - 返回结果的 `results.engine` 标明本次实际使用的后端；若前面有后端失败但最终成功，`results.fallback` 记录失败原因（避免静默降级无人察觉）；全部失败时 `results.attempts` 列出每个后端的原因。
@@ -474,7 +549,10 @@ travel_agent/
 - [x] ~~PostgreSQL 持久化 / Redis 缓存层~~（已完成：`context/backends.py` + `context/schema.sql`）
 - [x] ~~网络搜索主通道接入 Tavily~~（已完成：`query-info` 技能，DDGS 自动兜底）
 - [ ] 缓存命中率的独立基准测试（冷启动 / 多会话场景，目前 `status` 显示的是会话内累计值）
-- [ ] 更完整的多路召回（向量 + BM25 混合检索、Rerank）
+- [x] ~~多路召回（向量 + BM25 混合检索）~~（已完成：`utils/hybrid_retriever.py` + RRF 融合）
+- [ ] Rerank 精排（在 RRF 融合后接一个 Cross-Encoder 重排，进一步提升精度）
+- [x] ~~检索效果评测脚本~~（已完成：`scripts/eval_retrieval.py`，36 条标注 query + 6 条负例，输出 Hit@k / MRR 对比报告）
+- [ ] BM25 单路准入改用「至少命中 N 个查询实词」—— 实测正例 BM25 最高分 5.85~21.51、负例 3.30~10.41，**区间重叠，绝对分数阈值无法分开**（根因：IDF 的 `ln(1+...)` 平滑恒为正，小语料下稀有词命中会拿高分）
 - [ ] 支持更多 LLM / 切换模型
 - [ ] Web 界面（FastAPI + React）
 - [ ] 更多 Skill 插件（酒店预订、机票查询等）

@@ -8,8 +8,18 @@ LLM_CONFIG = {
 SYSTEM_CONFIG = {"enable_llm": True, "log_level": "INFO", "max_retries": 3, "timeout": 60}
 RAG_CONFIG = {
     "embedding_model": "data/models/bge-small-zh-v1.5",
-    "similarity_threshold": 0.5
+    "similarity_threshold": 0.5,
+    "hybrid": {
+        "enabled": True,        # False 则退回纯向量检索（用于 A/B 对比）
+        "top_k_dense": 10,      # 向量路召回条数
+        "top_k_sparse": 10,     # BM25 路召回条数
+        "rrf_k": 60,            # RRF 公式里的 k（原论文经验值）
+        "final_top_k": 3,       # 融合后最终返回条数
+        "bm25_k1": 1.5,         # BM25 词频饱和参数
+        "bm25_b": 0.75,         # BM25 文档长度归一化参数
+        "min_bm25_score": 0.5,  # BM25 单词面命中的准入阈值（防幻觉用，需用评测脚本调）
     }
+}
 RESILIENCE_CONFIG = {
     "max_retries": 3, "retry_base_delay_sec": 1.0, "retry_max_delay_sec": 30.0,
     "circuit_failure_threshold": 5, "circuit_recovery_timeout_sec": 60.0,

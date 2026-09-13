@@ -46,6 +46,16 @@ except ImportError as e:
     logger.warning("Install with: pip install pymilvus sentence-transformers")
     DEPENDENCIES_AVAILABLE = False
 
+# 混合检索（BM25 + RRF）。导入失败时自动退回纯向量检索，不影响主流程。
+try:
+    from utils.hybrid_retriever import BM25Index, reciprocal_rank_fusion
+    HYBRID_AVAILABLE = True
+except ImportError as e:  # pragma: no cover
+    BM25Index = None
+    reciprocal_rank_fusion = None
+    HYBRID_AVAILABLE = False
+    logger.warning(f"混合检索模块不可用，将退回纯向量检索: {e}")
+
 
 class RAGKnowledgeAgent(AgentBase):
     """RAG知识库智能体"""
@@ -136,9 +146,79 @@ class RAGKnowledgeAgent(AgentBase):
             )
             logger.info(f"Created new collection: {collection_name}")
 
+        # ---- 混合检索：把全部 chunk 载入内存构建 BM25 索引 ----
+        self._bm25 = None
+        self._corpus: Dict[object, Dict] = {}      # id -> {content, metadata}
+        self._hybrid_cfg: Dict = {}
+        try:
+            from config import RAG_CONFIG as _RAG_CFG
+            self._hybrid_cfg = (_RAG_CFG.get("hybrid") or {})
+        except Exception as e:
+            logger.warning(f"读取 RAG_CONFIG['hybrid'] 失败，使用默认值: {e}")
+            self._hybrid_cfg = {}
+
+        if self._hybrid_cfg.get("enabled") and HYBRID_AVAILABLE:
+            try:
+                self._build_bm25_index()
+            except Exception as e:
+                # 索引构建失败不应影响 Agent 可用性，退回纯向量检索
+                logger.warning(f"BM25 索引构建失败，本次退回纯向量检索: {e}")
+                self._bm25 = None
+        elif self._hybrid_cfg.get("enabled") and not HYBRID_AVAILABLE:
+            logger.warning("配置要求混合检索，但 hybrid_retriever 不可用")
+        else:
+            logger.info("混合检索未启用（hybrid.enabled=False），使用纯向量检索")
+
         self.initialized = True
         self._milvus_db_path = milvus_db_path  # 保存路径用于重连
         logger.info("RAG Knowledge Agent (Milvus Lite) initialized successfully")
+
+    def _build_bm25_index(self):
+        """
+        从 Milvus 取出全部 chunk，构建内存 BM25 索引。
+
+        注意：知识库重新灌数据后需重建（重启进程即可）。
+        """
+        self._ensure_connection()
+        # pymilvus 3.x：query/get 前必须先 load，否则报 "in state released"
+        self.milvus_client.load_collection(self.collection_name)
+        rows = self.milvus_client.query(
+            collection_name=self.collection_name,
+            filter="id >= 0",          # milvus-lite 需要一个表达式才能全量取
+            output_fields=["id", "content", "metadata"],
+            limit=16384,
+        )
+
+        docs = []
+        self._corpus = {}
+        for r in rows:
+            cid = r.get("id")
+            content = r.get("content") or ""
+            raw_meta = r.get("metadata") or "{}"
+            try:
+                meta = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+            except Exception:
+                meta = {}
+            self._corpus[cid] = {"content": content, "metadata": meta}
+            docs.append((cid, content))
+
+        if not docs:
+            raise RuntimeError("知识库为空，无法构建 BM25 索引")
+
+        cfg = self._hybrid_cfg or {}
+        self._bm25 = BM25Index(
+            docs,
+            k1=float(cfg.get("bm25_k1", 1.5)),
+            b=float(cfg.get("bm25_b", 0.75)),
+        )
+        st = self._bm25.stats()
+        logger.info(
+            "BM25 索引构建完成：%d 个 chunk，平均长度 %.1f token，词表 %d，"
+            "分词=%s，停用词过滤=%s",
+            st["docs"], st["avgdl"], st["vocab"],
+            "jieba" if st.get("jieba") else "bigram(降级)",
+            st.get("drop_stopwords"),
+        )
 
     def _ensure_connection(self):
         """确保 Milvus 连接正常，如果需要则重新创建客户端"""
@@ -223,9 +303,45 @@ class RAGKnowledgeAgent(AgentBase):
             logger.error(f"Error adding documents: {e}")
             return {"status": "error", "message": str(e)}
 
+    def _vector_search(self, query: str, limit: int) -> List[Dict]:
+        """
+        纯向量检索（不含阈值过滤），返回带 distance（余弦相似度）的原始结果。
+        """
+        self._ensure_connection()
+        # pymilvus 3.x 需先加载 collection 才能检索，否则报 "in state released"
+        self.milvus_client.load_collection(self.collection_name)
+
+        query_embedding = self.embedding_model.encode(query).tolist()
+        results = self.milvus_client.search(
+            collection_name=self.collection_name,
+            data=[query_embedding],
+            limit=limit,
+            output_fields=["id", "content", "metadata"],
+        )
+
+        out: List[Dict] = []
+        if results and len(results) > 0:
+            for hit in results[0]:
+                entity = hit.get("entity", {})
+                metadata_str = entity.get("metadata", "{}")
+                try:
+                    metadata = json.loads(metadata_str) if isinstance(metadata_str, str) else metadata_str
+                except Exception:
+                    metadata = {}
+                out.append({
+                    "id": entity.get("id", ""),
+                    "content": entity.get("content", ""),
+                    "metadata": metadata,
+                    "distance": float(hit.get("distance", 0.0)),
+                })
+        return out
+
     def search_knowledge(self, query: str, top_k: Optional[int] = None) -> List[Dict]:
         """
-        检索知识库
+        检索知识库。
+
+        - hybrid.enabled=True 且 BM25 索引可用时：向量路 + BM25 路 → RRF 融合
+        - 否则：纯向量检索（行为与改造前完全一致）
 
         Args:
             query: 查询文本
@@ -237,69 +353,117 @@ class RAGKnowledgeAgent(AgentBase):
         if not self.initialized:
             return []
 
+        cfg = self._hybrid_cfg or {}
+        use_hybrid = bool(cfg.get("enabled")) and self._bm25 is not None
+
         try:
-            # 确保连接正常
-            self._ensure_connection()
-            # pymilvus 3.x 需先加载 collection 才能检索，否则报 "in state released"
-            self.milvus_client.load_collection(self.collection_name)
-            k = top_k or self.top_k
-
-            # 生成查询向量
-            query_embedding = self.embedding_model.encode(query).tolist()
-
-            # 在 Milvus 中检索
-            results = self.milvus_client.search(
-                collection_name=self.collection_name,
-                data=[query_embedding],
-                limit=k,
-                output_fields=["id", "content", "metadata"]
-            )
-
-            # 格式化结果
-            retrieved_docs = []
-            if results and len(results) > 0:
-                for hit in results[0]:
-                    # 解析metadata
-                    metadata_str = hit.get("entity", {}).get("metadata", "{}")
-                    try:
-                        metadata = json.loads(metadata_str)
-                    except:
-                        metadata = {}
-
-                    retrieved_docs.append({
-                        'id': hit.get("entity", {}).get("id", ""),
-                        'content': hit.get("entity", {}).get("content", ""),
-                        'metadata': metadata,
-                        'distance': hit.get("distance", 0.0)
-                    })
-
-
-            if self.similarity_threshold is not None and retrieved_docs:
-                raw_count = len(retrieved_docs)
-                top_score = max(float(d.get("distance", 0.0)) for d in retrieved_docs)
-                kept = [
-                    d for d in retrieved_docs
-                    if float(d.get("distance", 0.0)) >= self.similarity_threshold
-                ]
-                if len(kept) < raw_count:
-                    logger.info(
-                        "相似度过滤：丢弃 %d/%d 条（阈值 %.2f，本次最高分 %.4f）",
-                        raw_count - len(kept), raw_count,
-                        self.similarity_threshold, top_score,
-                    )
-                retrieved_docs = kept
-
-            if not retrieved_docs:
-                logger.info(
-                    "无满足阈值的知识片段（query=%s，阈值=%.2f）",
-                    query[:50], self.similarity_threshold,
-                )
-            logger.info(f"Retrieved {len(retrieved_docs)} documents for query: {query[:50]}")
-            return retrieved_docs
-
+            if not use_hybrid:
+                return self._search_vector_only(query, top_k)
+            return self._search_hybrid(query, top_k)
         except Exception as e:
             logger.error(f"Error searching knowledge: {e}")
             return []
+
+    def _search_vector_only(self, query: str, top_k: Optional[int] = None) -> List[Dict]:
+        """纯向量检索 + 相似度阈值过滤（改造前的原始行为）。"""
+        k = top_k or self.top_k
+        retrieved_docs = self._vector_search(query, k)
+
+        if self.similarity_threshold is not None and retrieved_docs:
+            raw_count = len(retrieved_docs)
+            top_score = max(float(d.get("distance", 0.0)) for d in retrieved_docs)
+            kept = [
+                d for d in retrieved_docs
+                if float(d.get("distance", 0.0)) >= self.similarity_threshold
+            ]
+            if len(kept) < raw_count:
+                logger.info(
+                    "相似度过滤：丢弃 %d/%d 条（阈值 %.2f，本次最高分 %.4f）",
+                    raw_count - len(kept), raw_count,
+                    self.similarity_threshold, top_score,
+                )
+            retrieved_docs = kept
+
+        if not retrieved_docs:
+            logger.info(
+                "无满足阈值的知识片段（query=%s，阈值=%.2f）",
+                query[:50], self.similarity_threshold,
+            )
+        logger.info(f"Retrieved {len(retrieved_docs)} documents for query: {query[:50]}")
+        return retrieved_docs
+
+    def _search_hybrid(self, query: str, top_k: Optional[int] = None) -> List[Dict]:
+        """
+        混合检索：向量路 + BM25 路 → RRF 融合。
+
+        关键设计（容易踩坑）：
+          相似度阈值 similarity_threshold 是给**余弦分数**用的，而 RRF 分数
+          量级只有 1/(k+rank) ≈ 0.008~0.03，两者量纲完全不同。
+          因此阈值**只作用于向量路**，BM25 单路命中走独立的 min_bm25_score 准入。
+          否则把 0.5 套到 RRF 分数上会把所有结果过滤光。
+        """
+        cfg = self._hybrid_cfg or {}
+        final_k = int(top_k or cfg.get("final_top_k") or self.top_k)
+        kd = int(cfg.get("top_k_dense", 10))
+        ks = int(cfg.get("top_k_sparse", 10))
+        rrf_k = int(cfg.get("rrf_k", 60))
+        min_bm25 = float(cfg.get("min_bm25_score", 0.0) or 0.0)
+        thr = self.similarity_threshold
+
+        # ---- 向量路（阈值只在这里生效）----
+        dense = self._vector_search(query, kd)
+        if thr is not None:
+            dense = [d for d in dense if d["distance"] >= thr]
+
+        # ---- BM25 路 ----
+        sparse = [(cid, s) for cid, s in self._bm25.search(query, ks) if s >= min_bm25]
+
+        logger.info(
+            "混合检索：向量路 %d 条，BM25 路 %d 条（min_bm25=%.2f）",
+            len(dense), len(sparse), min_bm25,
+        )
+
+        if not dense and not sparse:
+            logger.info(
+                "混合检索无满足阈值的知识片段（query=%s，余弦阈值=%.2f，bm25阈值=%.2f）",
+                query[:50], thr if thr is not None else -1, min_bm25,
+            )
+            return []
+
+        # ---- RRF 融合 ----
+        dense_ranked = [(d["id"], d["distance"]) for d in dense]
+        fused = reciprocal_rank_fusion([dense_ranked, sparse], k=rrf_k)
+
+        by_id = {d["id"]: d for d in dense}
+        sparse_ids = {cid for cid, _ in sparse}
+
+        out: List[Dict] = []
+        for doc_id, rrf_score in fused:
+            if doc_id in by_id:
+                item = dict(by_id[doc_id])
+                item["matched_by"] = "vector+bm25" if doc_id in sparse_ids else "vector"
+            else:
+                # 仅 BM25 命中：语料里有但向量路没召回
+                rec = self._corpus.get(doc_id)
+                if rec is None:
+                    continue
+                item = {
+                    "id": doc_id,
+                    "content": rec["content"],
+                    "metadata": rec["metadata"],
+                    "distance": None,          # 无余弦分数（reply() 不使用该字段）
+                    "matched_by": "bm25",
+                }
+            item["rrf_score"] = round(rrf_score, 6)
+            out.append(item)
+            if len(out) >= final_k:
+                break
+
+        logger.info(
+            "混合检索返回 %d 条（来源：%s）",
+            len(out), [d.get("matched_by") for d in out],
+        )
+        return out
 
     async def reply(self, x: Optional[Union[Msg, List[Msg]]] = None) -> Msg:
         """

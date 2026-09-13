@@ -19,6 +19,30 @@ INTENT_CONFIG = {
     # agent_schedule 中 confidence 低于此值的任务不予调度
     "confidence_threshold": 0.5,
 }
+# 网络搜索：多后端可插拔（Tavily / DDGS）
+SEARCH_CONFIG = {
+    # auto: 按 auto_order 依次尝试；也可强制 "tavily" / "ddgs"
+    "backend": "auto",
+    "auto_order": ["tavily", "ddgs"],
+    "tavily": {
+        # 控制台 https://app.tavily.com ；免费 1000 credits/月
+        # 建议改用环境变量 TAVILY_API_KEY
+        "api_key": "",
+        "endpoint": "https://api.tavily.com/search",
+        "search_depth": "basic",   # basic(1 credit) | advanced(2 credits)
+        "max_results": 10,
+        "topic": "general",
+        "timeout": 15.0,
+        "max_content_chars": 500,  # Tavily 返回正文较长，截断后再摘要
+    },
+    "ddgs": {
+        "backends": ["bing", "duckduckgo", "auto"],
+        "max_results": 10,
+        "region": "cn-zh",
+        "safesearch": "on",
+    },
+    "max_results": 5,        # 过滤可疑域名后最多保留几条给 LLM 摘要
+}
 # 存储后端：Redis 缓存 + PostgreSQL 长期记忆
 STORAGE_CONFIG = {
     # auto     : 优先 PG/Redis，连不上自动降级为 JSON + 内存

@@ -165,7 +165,9 @@
 ### 4. 信息查询（联网搜索）
 
 - **天气**：`wttr.in` 免费接口（结果可靠、无需 Key）
-- **网络搜索**：`ddgs`（DuckDuckGo 多后端），开启 safesearch + 过滤可疑域名
+- **网络搜索**：**多后端可插拔** —— Tavily（主）/ DDGS（兜底），按 `auto_order` 依次尝试，前一个失败自动换下一个
+- **通道可视**：返回结果的 `results.engine` 标注本次实际走哪个后端；全失败时 `results.attempts` 列出各自原因
+- **统一归一化**：无论哪个后端，结果统一为 `{title, snippet, url}`，并过滤可疑域名（safesearch / 可疑 TLD）
 - **LLM 自动摘要**：对搜索结果智能提取，返回来源
 - **异步查询**：提升响应速度
 
@@ -273,7 +275,7 @@ python cli.py
 | **memory-query**（记忆查询） | 查询旅行历史、用户偏好、历史对话摘要，用 LLM 生成自然语言回答 |
 | **event-collection**（事项收集） | 提取出发地、目的地、出发时间、返程时间、出行目的，主动推断缺失信息 |
 | **preference**（偏好管理） | 管理酒店、航空、座位、房型、机型、餐饮、交通、预算等偏好；支持任意自定义类型；智能识别追加/覆盖 |
-| **query-info**（信息查询） | `wttr.in`（天气）+ DDGS（联网搜索）+ LLM 摘要 |
+| **query-info**（信息查询） | `wttr.in`（天气）+ Tavily / DDGS（联网搜索）+ LLM 摘要 |
 | **ask-question**（知识问答） | Milvus Lite + bge-small-zh-v1.5 检索知识库并生成答案，返回文档溯源 |
 | **plan-trip**（行程规划） | 整合各 Skill 结果与用户偏好，生成完整行程（每日安排、住宿、餐饮、交通、注意事项） |
 
@@ -387,7 +389,8 @@ travel_agent/
 
 ### 联网与搜索
 - 🌐 **wttr.in** - 天气查询（免费）
-- 🔎 **ddgs** - 网络搜索（多后端）
+- 🔎 **Tavily** - 网络搜索主通道（RAG 友好，免费 1000 credits/月）
+- 🔁 **ddgs** - 零配置兜底通道（多后端）
 - 📝 **LLM 自动摘要** - 搜索结果智能提取
 
 ### 架构设计
@@ -430,11 +433,46 @@ travel_agent/
 - 向量库文件：`.claude/skills/ask-question/data/rag_knowledge/milvus_lite.db`
 - 若使用 `pymilvus 3.x`，需在 `search_knowledge()` 中先调用 `load_collection()` 再检索（代码已处理）
 
+### 网络搜索配置（多后端可插拔）
+- 后端由 `config.py` 的 `SEARCH_CONFIG` 控制：
+  ```python
+  "backend": "auto",                    # auto | tavily | ddgs
+  "auto_order": ["tavily", "ddgs"],     # auto 模式下的尝试顺序
+  ```
+  `auto` 会依次尝试，任一成功即用；某个后端未配置 / 超时 / 配额用尽 / 返回 0 条，都会自动换下一个。
+- **后端对比**：
+
+  | 后端 | 凭据 | 免费额度 | 说明 |
+  |------|------|----------|------|
+  | **Tavily** ⭐ | `TAVILY_API_KEY` | 1000 credits/月 | **主通道**。返回抽取好的正文，适合 RAG；控制台 <https://app.tavily.com> |
+  | DDGS | 无需 Key | 无限制 | 兜底通道。抓取公开页面，零配置；实测部分后端已失效，较脆弱 |
+
+- **填 Key 推荐直接写进 `config.py`**（`config.py` 已被 `.gitignore` 忽略，Key 不会进仓库）：
+  ```python
+  SEARCH_CONFIG = {
+      "tavily": {"api_key": "tvly-你的Key", ...},
+      ...
+  }
+  ```
+  > ⚠️ 也可以用环境变量 `setx TAVILY_API_KEY "tvly-你的Key"`，但要注意 **Windows 的坑**：
+  > `setx` 不会注入**已运行**的进程。若终端继承自已运行的父进程（Windows Terminal / VS Code /
+  > 资源管理器未刷新），**重开标签页甚至重开窗口都可能仍读不到**，表现为「明明设置了，程序却说未配置」。
+  > 遇到这种情况，最省事的办法就是回到上面直接写进 `config.py`。
+- **自检与排错**：
+  ```powershell
+  venv\Scripts\python.exe scripts\check_search_api.py          # 逐后端实测（Tavily/DDGS）
+  venv\Scripts\python.exe scripts\check_search_api.py tavily   # 只测 Tavily
+  venv\Scripts\python.exe tests\test_search_backend.py         # 离线验证回退编排（32 项）
+  ```
+  诊断脚本会自动识别「环境变量已在注册表但当前进程读不到」这种情况，并打印注册表里的值和解法。
+- 返回结果的 `results.engine` 标明本次实际使用的后端；若前面有后端失败但最终成功，`results.fallback` 记录失败原因（避免静默降级无人察觉）；全部失败时 `results.attempts` 列出每个后端的原因。
+
 ---
 
 ## 🚀 未来规划
 
 - [x] ~~PostgreSQL 持久化 / Redis 缓存层~~（已完成：`context/backends.py` + `context/schema.sql`）
+- [x] ~~网络搜索主通道接入 Tavily~~（已完成：`query-info` 技能，DDGS 自动兜底）
 - [ ] 缓存命中率的独立基准测试（冷启动 / 多会话场景，目前 `status` 显示的是会话内累计值）
 - [ ] 更完整的多路召回（向量 + BM25 混合检索、Rerank）
 - [ ] 支持更多 LLM / 切换模型

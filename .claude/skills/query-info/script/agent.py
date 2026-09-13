@@ -1,14 +1,18 @@
 """
-信息查询智能体 - 真实检索版（免费API）
-支持：天气（wttr.in）、网络搜索（DDGS，开启 safesearch + 结果过滤）
+信息查询智能体 - 真实检索版
 
-使用免费API：
-- 天气：wttr.in（无需 API Key）
-- 搜索：ddgs（Dux Distributed Global Search，可选 bing/duckduckgo 等，需安装：pip install ddgs）
+支持：天气（wttr.in）、网络搜索（多后端可插拔：Tavily / DDGS）
+
+数据来源：
+- 天气：wttr.in（免费，无需 API Key）
+- 搜索（按 config.SEARCH_CONFIG["auto_order"] 依次尝试，前一个失败自动换下一个）：
+    1. Tavily Search API（需 API Key，免费 1000 credits/月）
+    2. DDGS（抓取公开页面，无需 Key，需 pip install ddgs）
 """
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
 from typing import Optional, Union, List, Dict, Any
+import asyncio
 import json
 import logging
 import re
@@ -18,7 +22,19 @@ import os
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
+try:
+    from config import SEARCH_CONFIG
+except ImportError:  # 兼容尚未更新 config.py 的旧部署
+    SEARCH_CONFIG = {"backend": "ddgs", "tavily": {}, "ddgs": {}, "max_results": 5}
+
 logger = logging.getLogger(__name__)
+
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
+    logger.warning("httpx not installed. Install with: pip install httpx")
 
 # 尝试导入 duckduckgo_search (旧包名) 或 ddgs (新包名)
 try:
@@ -30,6 +46,10 @@ try:
 except ImportError:
     DDGS_AVAILABLE = False
     logger.warning("ddgs not installed. Install with: pip install ddgs")
+
+
+class SearchBackendUnavailable(Exception):
+    """单个搜索后端不可用（未配置 / 网络失败 / 配额用尽），调用方据此回退到下一个后端。"""
 
 # 疑似垃圾/低质域名：多为 SEO 或不良站，不展示给用户
 _SUSPICIOUS_DOMAIN_PATTERN = re.compile(
@@ -222,84 +242,245 @@ class InformationQueryAgent(AgentBase):
         m = re.search(r"[\u4e00-\u9fa5]{2,6}", q)
         return m.group(0).strip() if m else ""
 
-    async def _web_search(self, query: str) -> Dict[str, Any]:
-        """
-        网络搜索 - 使用 DDGS（Dux Distributed Global Search），开启 safesearch，过滤可疑来源。
+    # ---------- 网络搜索：多后端可插拔（Tavily / DDGS） ----------
 
-        Args:
-            query: 用户查询
-
-        Returns:
-            搜索结果
+    def _search_order(self) -> List[str]:
         """
-        if not DDGS_AVAILABLE:
-            return {
-                "query_type": "网络搜索",
-                "query_success": False,
-                "results": {
-                    "message": "搜索库未安装",
-                    "note": "请运行：pip install ddgs",
-                },
-            }
+        决定后端尝试顺序。
+
+        - backend 为具体后端名（tavily / ddgs）时，只试它
+        - backend="auto" 时按 SEARCH_CONFIG["auto_order"] 依次尝试
+        """
+        backend = str((SEARCH_CONFIG or {}).get("backend", "auto")).lower()
+        if backend in ("tavily", "ddgs"):
+            return [backend]
+
+        order = (SEARCH_CONFIG or {}).get("auto_order")
+        if not isinstance(order, list) or not order:
+            order = ["tavily", "ddgs"]
+        # 只保留已知后端，防止配置写错导致整条链路静默失效
+        known = [b for b in order if b in ("tavily", "ddgs")]
+        return known or ["tavily", "ddgs"]
+
+    def _tavily_search_sync(self, query: str) -> List[Dict[str, str]]:
+        """
+        Tavily Search API（同步实现，由 asyncio.to_thread 调度）。
+
+        文档：https://docs.tavily.com/documentation/api-reference/endpoint/search
+        控制台：https://app.tavily.com （免费 1000 credits/月）
+
+        与 DDGS 的区别：Tavily 返回的是**已抽取好的正文**（content），
+        比搜索摘要长得多，因此按 max_content_chars 截断后再交给 LLM 摘要。
+        """
+        if not HTTPX_AVAILABLE:
+            raise SearchBackendUnavailable("httpx 未安装：pip install httpx")
+
+        cfg = (SEARCH_CONFIG or {}).get("tavily", {}) or {}
+        api_key = str(cfg.get("api_key") or "").strip() or os.environ.get("TAVILY_API_KEY", "").strip()
+        if not api_key:
+            raise SearchBackendUnavailable(
+                "未配置 Tavily API Key：请设置环境变量 TAVILY_API_KEY，"
+                "或在 config.py 的 SEARCH_CONFIG['tavily']['api_key'] 填写"
+            )
+
+        body: Dict[str, Any] = {
+            "query": query,
+            "max_results": max(1, min(20, int(cfg.get("max_results", 10) or 10))),
+            "search_depth": cfg.get("search_depth", "basic"),
+            "include_answer": False,        # 摘要由本项目的 LLM 环节统一生成
+            "include_raw_content": False,   # 只要抽取后的正文，不要原始 HTML
+            "include_images": False,
+        }
+        if cfg.get("topic"):
+            body["topic"] = cfg["topic"]
+        if cfg.get("country"):
+            body["country"] = cfg["country"]
 
         try:
-            ddgs = DDGS()
-            # 开启安全搜索，优先 bing 后端（质量更稳定），多取几条再过滤
-            search_results = []
-            for backend in ("bing", "duckduckgo", "auto"):
-                try:
-                    raw = ddgs.text(
-                        query,
-                        max_results=10,
-                        safesearch="on",
-                        region="cn-zh",
-                        backend=backend,
-                    )
-                    search_results = list(raw)
-                    if search_results:
-                        break
-                except Exception as e:
-                    logger.debug(f"DDGS backend {backend} failed: {e}")
-                    continue
-
-            results = []
-            for result in search_results:
-                href = result.get("href", "")
-                if _is_suspicious_url(href):
-                    continue
-                results.append({
-                    "title": result.get("title", ""),
-                    "snippet": result.get("body", ""),
-                    "url": href,
-                })
-                if len(results) >= 5:
-                    break
-
-            if not results:
-                return {
-                    "query_type": "网络搜索",
-                    "query_success": False,
-                    "results": {"message": "未找到相关结果"},
-                }
-
-            # 使用 LLM 总结搜索结果
-            summary = await self._summarize_search_results(query, results)
-
-            return {
-                "query_type": "网络搜索",
-                "query_success": True,
-                "results": {
-                    "summary": summary,
-                    "sources": results,
+            resp = httpx.post(
+                cfg.get("endpoint", "https://api.tavily.com/search"),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
                 },
-            }
+                json=body,
+                timeout=float(cfg.get("timeout", 15.0)),
+            )
         except Exception as e:
-            logger.error(f"Web search failed: {e}")
+            raise SearchBackendUnavailable(f"Tavily 请求失败（网络不通或超时）: {e}") from e
+
+        if resp.status_code != 200:
+            detail = (resp.text or "")[:200]
+            try:
+                payload = resp.json()
+                detail = (payload.get("detail") or payload.get("error") or detail)
+                if isinstance(detail, (dict, list)):
+                    detail = json.dumps(detail, ensure_ascii=False)[:200]
+            except Exception:
+                pass
+
+            hint = ""
+            if resp.status_code == 401:
+                hint = "（API Key 无效或已被撤销，请到 app.tavily.com 重新复制）"
+            elif resp.status_code == 429:
+                hint = "（额度用尽或请求过频：免费 1000 credits/月，basic 检索 1 credit/次）"
+            elif resp.status_code == 432:
+                hint = "（Tavily 账户额度/权限不足）"
+            elif resp.status_code == 400:
+                hint = "（请求参数有误）"
+            raise SearchBackendUnavailable(
+                f"Tavily 返回 HTTP {resp.status_code}{hint} {detail}".strip()
+            )
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise SearchBackendUnavailable(f"Tavily 响应解析失败: {e}") from e
+
+        limit_chars = int(cfg.get("max_content_chars", 500) or 500)
+        results: List[Dict[str, str]] = []
+        for item in data.get("results") or []:
+            url = (item.get("url") or "").strip()
+            if not url:
+                continue
+            content = item.get("content") or ""
+            if limit_chars > 0 and len(content) > limit_chars:
+                content = content[:limit_chars] + "…"
+            results.append({
+                "title": item.get("title", ""),
+                "snippet": content,
+                "url": url,
+            })
+
+        if not results:
+            raise SearchBackendUnavailable("Tavily 未返回任何结果")
+        return results
+
+    def _ddgs_search_sync(self, query: str) -> List[Dict[str, str]]:
+        """DDGS 兜底检索（同步实现，由 asyncio.to_thread 调度）。"""
+        if not DDGS_AVAILABLE:
+            raise SearchBackendUnavailable("ddgs 未安装：pip install ddgs")
+
+        cfg = (SEARCH_CONFIG or {}).get("ddgs", {}) or {}
+        backends = cfg.get("backends") or ["bing", "duckduckgo", "auto"]
+        last_error = None
+
+        for backend in backends:
+            try:
+                raw = DDGS().text(
+                    query,
+                    max_results=int(cfg.get("max_results", 10) or 10),
+                    safesearch=cfg.get("safesearch", "on"),
+                    region=cfg.get("region", "cn-zh"),
+                    backend=backend,
+                )
+            except Exception as e:
+                last_error = f"{backend}: {e}"
+                logger.debug(f"DDGS backend {backend} failed: {e}")
+                continue
+
+            results = [
+                {
+                    "title": r.get("title", ""),
+                    "snippet": r.get("body", ""),
+                    "url": r.get("href", ""),
+                }
+                for r in raw
+                if r.get("href")
+            ]
+            if results:
+                return results
+
+        raise SearchBackendUnavailable(
+            f"DDGS 各后端均未返回结果（{last_error}）" if last_error else "DDGS 各后端均未返回结果"
+        )
+
+    async def _web_search(self, query: str) -> Dict[str, Any]:
+        """
+        网络搜索：按 SEARCH_CONFIG['backend'] / ['auto_order'] 依次尝试各后端。
+
+        - 任一后端成功即返回，并在 results.engine 标注实际通道（tavily | ddgs）
+        - 全部失败时返回 query_success=False，并附带每个后端的失败原因，便于排查
+        - 成功结果统一归一化为 {title, snippet, url}，并过滤可疑域名后截断
+        """
+        raw_results: List[Dict[str, str]] = []
+        used_engine: Optional[str] = None
+        attempts: List[str] = []
+
+        runners = {
+            "tavily": self._tavily_search_sync,
+            "ddgs": self._ddgs_search_sync,
+        }
+
+        for engine in self._search_order():
+            runner = runners.get(engine)
+            if runner is None:
+                attempts.append(f"{engine}: 未知后端")
+                continue
+            try:
+                raw_results = await asyncio.to_thread(runner, query)
+                if not raw_results:
+                    # 后端可用但没搜到东西，同样换下一个试试，别让空结果终止整条链路
+                    attempts.append(f"{engine}: 返回 0 条结果")
+                    logger.info(f"搜索后端 {engine} 返回 0 条结果，尝试下一个")
+                    continue
+                used_engine = engine
+                logger.info(f"Search via {engine}: {len(raw_results)} raw results")
+                break
+            except SearchBackendUnavailable as e:
+                attempts.append(f"{engine}: {e}")
+                logger.info(f"搜索后端 {engine} 不可用，尝试下一个: {e}")
+            except Exception as e:
+                attempts.append(f"{engine}: {e}")
+                logger.warning(f"搜索后端 {engine} 异常: {e}")
+
+        if not raw_results:
             return {
                 "query_type": "网络搜索",
                 "query_success": False,
-                "results": {"error": f"搜索失败: {str(e)}"},
+                "results": {
+                    "message": "未找到相关结果",
+                    "attempts": attempts,
+                },
             }
+
+        # 过滤可疑来源并截断
+        limit = int((SEARCH_CONFIG or {}).get("max_results", 5) or 5)
+        results: List[Dict[str, str]] = []
+        for result in raw_results:
+            if _is_suspicious_url(result.get("url", "")):
+                continue
+            results.append(result)
+            if len(results) >= limit:
+                break
+
+        if not results:
+            return {
+                "query_type": "网络搜索",
+                "query_success": False,
+                "results": {
+                    "message": "未找到相关结果（结果均被可疑域名过滤）",
+                    "engine": used_engine,
+                },
+            }
+
+        # 使用 LLM 总结搜索结果
+        summary = await self._summarize_search_results(query, results)
+
+        payload: Dict[str, Any] = {
+            "summary": summary,
+            "sources": results,
+            "engine": used_engine,
+        }
+        if attempts:
+            # 成功了但前面有后端失败 —— 暴露出来，避免静默降级无人察觉
+            payload["fallback"] = attempts
+
+        return {
+            "query_type": "网络搜索",
+            "query_success": True,
+            "results": payload,
+        }
 
     async def _summarize_search_results(self, query: str, results: List[Dict]) -> str:
         """

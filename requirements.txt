@@ -15,7 +15,10 @@ sentence-transformers==5.2.3
 # CLI 界面
 rich==13.9.4
 
-# 网络搜索（DDGS）
+# 网络搜索
+# Tavily API 走 httpx（天气 wttr.in 也用它）
+httpx>=0.27
+# DDGS 兜底通道
 ddgs==9.10.0
 
 # 长期记忆持久化（PostgreSQL）

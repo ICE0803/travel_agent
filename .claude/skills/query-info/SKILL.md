@@ -1,11 +1,11 @@
 ---
 name: query-info
-description: Use this skill when the user wants to query real-time information like weather or general web search. Triggers when user asks "天气怎么样", "XX天气", "查一下XX", "搜索XX". This skill uses InformationQueryAgent (weather via wttr.in, web search via DDGS). For travel standards or policy questions use ask-question (RAG) instead.
+description: Use this skill when the user wants to query real-time information like weather or general web search. Triggers when user asks "天气怎么样", "XX天气", "查一下XX", "搜索XX". This skill uses InformationQueryAgent (weather via wttr.in, web search via Tavily with DDGS fallback). For travel standards or policy questions use ask-question (RAG) instead.
 ---
 
 # Query Information (天气与网络搜索)
 
-查询**天气**（wttr.in）和**网络搜索**（DDGS），使用 **InformationQueryAgent**。差旅标准、报销政策等由 **ask-question**（RAG）处理。
+查询**天气**（wttr.in）和**网络搜索**（多后端可插拔：Tavily / DDGS，前一个失败自动换下一个），使用 **InformationQueryAgent**。差旅标准、报销政策等由 **ask-question**（RAG）处理。
 
 ## When to Use
 
@@ -21,7 +21,56 @@ description: Use this skill when the user wants to query real-time information l
 ## 支持的查询类型（本 Agent 实际实现）
 
 1. **天气查询**：基于 wttr.in，无需 API Key
-2. **网络搜索**：基于 DDGS（需 `pip install ddgs`），带摘要
+2. **网络搜索**：多后端可插拔（Tavily / DDGS），带 LLM 摘要
+
+## 网络搜索配置
+
+后端由 `config.py` 的 `SEARCH_CONFIG` 控制：
+
+```python
+SEARCH_CONFIG = {
+    "backend": "auto",                    # auto | tavily | ddgs
+    "auto_order": ["tavily", "ddgs"],     # auto 模式下的尝试顺序
+    ...
+}
+```
+
+| backend | 行为 |
+|---------|------|
+| `"auto"`（默认） | 按 `auto_order` 依次尝试，任一成功即用；全失败才报错 |
+| `"tavily"` / `"ddgs"` | 只用指定后端，失败直接报错（便于压测单通道） |
+
+**两个后端的定位：**
+
+| 后端 | 凭据 | 免费额度 | 说明 |
+|------|------|----------|------|
+| **Tavily** ⭐ | `TAVILY_API_KEY` | 1000 credits/月 | **主通道**。返回抽取好的正文，适合 RAG；basic 检索 1 credit/次 |
+| DDGS | 无需 Key | 无限制 | 兜底通道。抓取公开页面，零配置但较脆弱（部分后端已失效） |
+
+**填 Key 推荐直接写进 `config.py`**（`config.py` 已被 `.gitignore` 忽略，Key 不会进仓库）：
+
+```python
+SEARCH_CONFIG = {
+    "tavily": {"api_key": "tvly-你的Key", ...},
+    ...
+}
+```
+
+> ⚠️ 也可以用环境变量 `setx TAVILY_API_KEY "tvly-你的Key"`，但要注意 **Windows 的坑**：
+> `setx` 只对**之后新启动**的进程生效。若终端继承自已运行的父进程（Windows Terminal / VS Code /
+> 资源管理器），重开标签页甚至重开窗口都可能仍读不到，表现为「明明设置了却提示未配置」。
+> 遇到这种情况，最省事的办法就是回到上面直接写进 `config.py`。
+
+返回结果里的 `results.engine` 会标注本次实际走的是哪个后端（`tavily` / `ddgs`），便于排查。
+若前面有后端失败但最终成功，`results.fallback` 会记录失败原因（**避免静默降级无人察觉**）；全部失败时则是 `results.attempts`。
+
+**自检：**
+
+```powershell
+venv\Scripts\python.exe scripts\check_search_api.py          # 逐后端实测
+venv\Scripts\python.exe scripts\check_search_api.py tavily   # 只测 Tavily
+venv\Scripts\python.exe tests\test_search_backend.py         # 离线验证回退编排
+```
 
 ## 初始化与调用
 
@@ -62,7 +111,7 @@ data = asyncio.run(query_info("北京明天天气怎么样？"))
 ## 注意
 
 - 本 Agent **不**处理「差旅标准」「申请单状态」「历史行程」等；差旅标准请用 **ask-question**（RAG），历史行程请用 **memory-query**。
-- 网络搜索依赖：`pip install ddgs`（或 `duckduckgo-search`）。
+- 网络搜索依赖：Tavily 通道需 `httpx` + API Key；DDGS 兜底需 `pip install ddgs`。
 
 
 ## 信息查询总结指南

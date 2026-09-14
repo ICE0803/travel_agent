@@ -32,8 +32,24 @@ from agentscope.model import OpenAIChatModel
 from config_agentscope import init_agentscope
 from config import LLM_CONFIG
 from agents.intention_agent import IntentionAgent
-from agents.event_collection_agent import EventCollectionAgent
-from agents.itinerary_planning_agent import ItineraryPlanningAgent
+
+# ⚠️ 子 Agent 已插件化到 .claude/skills/<skill>/script/agent.py，
+#    不再是 agents/<name>_agent.py —— 那是改造前的结构，那些模块已不存在。
+#    生产路径由 LazyAgentRegistry 动态加载 script/agent.py；这里给一个等价的最小加载器。
+import importlib.util
+from pathlib import Path
+
+_SKILLS_ROOT = Path(".claude/skills")      # 相对项目根目录运行
+
+def load_skill_agent(skill_name: str, class_name: str):
+    path = _SKILLS_ROOT / skill_name / "script" / "agent.py"
+    spec = importlib.util.spec_from_file_location(f"{skill_name}_agent", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return getattr(module, class_name)
+
+EventCollectionAgent = load_skill_agent("event-collection", "EventCollectionAgent")
+ItineraryPlanningAgent = load_skill_agent("plan-trip", "ItineraryPlanningAgent")
 
 async def plan_trip(user_query: str):
     init_agentscope()
@@ -75,6 +91,10 @@ async def plan_trip(user_query: str):
 result = asyncio.run(plan_trip("规划一下2月27日从上海到北京的路程"))
 # result: {"itinerary": {"title", "duration", "route", "daily_plans", "notes", ...}, "planning_complete": bool}
 ```
+
+> 上面是**简化链式示例**。完整可运行版本见 `.claude/skills/plan-trip/script/plan_trip_execution.py`
+> —— 那是个**独立脚本，不被系统加载**（`LazyAgentRegistry` 只认 `script/agent.py`），
+> 用途就是这份示例的参考实现，手动跑可端到端验证「意图 → 事项收集 → 行程规划」这条链。
 
 ## EventCollectionAgent 输出字段（示例）
 

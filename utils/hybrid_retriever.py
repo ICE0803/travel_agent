@@ -221,6 +221,53 @@ class BM25Index:
         }
 
 
+def limit_per_doc(
+    items: Sequence[Dict],
+    max_per_doc: int = 1,
+    limit: Optional[int] = None,
+    parent_key: str = "parent_doc",
+) -> List[Dict]:
+    """
+    限制同一篇文档最多出现几个 chunk，防止同文档的多个 chunk 占满 Top-K。
+
+    为什么需要（实测）：
+      RRF 是按**排名**累加分数的（`RRF(d) = Σ 1/(k+rank)`），一篇文档有几个 chunk
+      被召回，就会各自贡献一份分数 —— 等于给"chunk 多的文档"变相加权。
+      同时这些 chunk 会挤占 Top-K 的槽位。实测「紧急出差可以后补审批吗」返回的
+      3 条**全是** `04_faq.txt`，期望的 `12_seasonal_policies.txt` 压根没进 Top-3，
+      直接导致混合检索 Hit@3 只有 51/53、反而不如纯 BM25 的 53/53。
+
+    参数：
+        items:       已按相关性降序排好的候选（每个含 metadata / id）
+        max_per_doc: 每篇文档最多保留几条；<=0 表示不限制
+        limit:       截断条数（None 表示不截断）
+        parent_key:  metadata 里标识"同一篇文档"的字段名
+
+    去重键优先取 `metadata[parent_key]`；缺失时退化为该 chunk 自身的 id，
+    即"每个 chunk 都算独立文档"→ 等于不去重（不会误删）。
+
+    注意：这里只在**输出侧**去重，向量路 / BM25 路进 RRF 之前没有去重。
+    RRF 的文档级加权效应因此还在，只是不再挤占最终槽位。
+    若日后要进一步优化，可以考虑在 RRF 之前先按文档去重各路召回。
+    """
+    if not items:
+        return []
+    if not max_per_doc or max_per_doc <= 0:
+        return list(items[:limit] if limit else items)
+
+    seen: Dict[object, int] = {}
+    out: List[Dict] = []
+    for it in items:
+        pdoc = (it.get("metadata") or {}).get(parent_key) or it.get("id")
+        if seen.get(pdoc, 0) >= max_per_doc:
+            continue
+        seen[pdoc] = seen.get(pdoc, 0) + 1
+        out.append(it)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
 # --------------------------------------------------------------------------
 # RRF 融合
 # --------------------------------------------------------------------------

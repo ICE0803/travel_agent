@@ -36,6 +36,20 @@ try:
 except Exception:
     pass
 
+# ⚠️ RAG_CONFIG 必须在**模块级**导入。
+# 之前它只在 build_reranker() 内部用 `from config import RAG_CONFIG` 局部导入，
+# 而 main() 里又引用了它 → NameError: name 'RAG_CONFIG' is not defined，
+# 评测跑完 2/4、3/4 之后崩溃，汇总表和报告文件全都没生成。
+from config import RAG_CONFIG
+from utils.reranker import CrossEncoderReranker, resolve_model_path
+
+# 评测用的精排器，由 main() 装载后注入（evaluate() 的回调签名固定，用模块级变量）
+_RERANKER = None
+
+# 候选池宽度取自 config，保证评测与生产跑的是同一条流水线
+# （否则会出现「评测用 10 条候选、生产用 3 条」的不可复现数字）
+RRF_CANDIDATES = int((RAG_CONFIG.get("hybrid") or {}).get("rrf_candidates", 10))
+
 # --------------------------------------------------------------------------
 # 标注集：query -> 期望命中的源文档
 # 构造原则：优先挑**该文档独有**的内容，减少与其他文档的歧义
@@ -267,10 +281,102 @@ def negative_scores(agent, k):
     return rows
 
 
+def positive_cosine_stats(agent, kd):
+    """
+    正例里「**期望文档自己**的最高余弦」—— 这是向量阈值**不能切掉**的下限。
+
+    与精排闸门同一口径：阈值要保住的是期望文档最好的那个 chunk，而不是召回列表的
+    top-1 —— top-1 往往是错文档，它对阈值不构成约束。
+
+    注意 `_vector_search` 本身不过阈值，所以这里拿到的是原始余弦。
+    只统计进入向量路候选池（top_k_dense）的部分，与真实流水线一致。
+    """
+    rows = []
+    for query, expect in CASES:
+        exp = expected_set(expect)
+        try:
+            hits = agent._vector_search(query, kd)
+        except Exception:
+            hits = []
+        own = [h["distance"] for h in hits if source_of(h, agent._corpus) in exp]
+        rows.append({
+            "query": query,
+            "own_max": max(own) if own else None,
+            "top1": max((h["distance"] for h in hits), default=0.0),
+        })
+    return rows
+
+
+def build_reranker():
+    """按 RAG_CONFIG['rerank'] 构建精排器；不可用则返回 None。"""
+    cfg = RAG_CONFIG.get("rerank") or {}
+    model = cfg.get("model")
+    if resolve_model_path(model) is None and not cfg.get("allow_download"):
+        print(f"  ✗ 精排模型不存在：{model}")
+        print("    先下载：venv\\Scripts\\python.exe scripts\\download_reranker.py")
+        return None
+
+    rr = CrossEncoderReranker(
+        model_name_or_path=model,
+        device=cfg.get("device"),
+        batch_size=int(cfg.get("batch_size", 16)),
+        max_length=int(cfg.get("max_length", 512)),
+        allow_download=bool(cfg.get("allow_download", False)),
+    )
+    if not rr.available:
+        print("  ✗ 精排模型装载失败（详见日志）")
+        return None
+    return rr
+
+
+def _with_rerank(agent, k, mode="rerank", threshold=None):
+    """上下文管理器：临时给 agent 挂上精排器，退出时恢复，保证其他三列基线不被污染。"""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        saved_reranker = agent._reranker
+        saved_cfg = agent._rerank_cfg
+        saved_final = agent._hybrid_cfg.get("final_top_k")
+        saved_cand = agent._hybrid_cfg.get("rrf_candidates")
+        agent._reranker = _RERANKER
+        agent._rerank_cfg = {"mode": mode, "score_threshold": threshold}
+        agent._hybrid_cfg["final_top_k"] = k
+        agent._hybrid_cfg["rrf_candidates"] = max(k, RRF_CANDIDATES)
+        try:
+            yield
+        finally:
+            agent._reranker = saved_reranker
+            agent._rerank_cfg = saved_cfg
+            for key, val in (("final_top_k", saved_final), ("rrf_candidates", saved_cand)):
+                if val is None:
+                    agent._hybrid_cfg.pop(key, None)
+                else:
+                    agent._hybrid_cfg[key] = val
+    return _cm()
+
+
+def search_hybrid_rerank(agent, query, k):
+    """混合 + 精排**重排**：RRF 保宽候选池 → 精排排序 → 取 k（A/B 对比用）。"""
+    with _with_rerank(agent, k, mode="rerank"):
+        return agent.search_knowledge(query)
+
+
+def search_hybrid_gate(agent, query, k, threshold):
+    """混合 + 精排**闸门**：排序仍用 RRF，只用精排分数丢掉低相关片段（推荐用法）。"""
+    with _with_rerank(agent, k, mode="filter", threshold=threshold):
+        return agent.search_knowledge(query)
+
+
 def main():
     ap = argparse.ArgumentParser(description="检索效果评测")
     ap.add_argument("--k", type=int, default=3, help="Top-K（默认 3，与生产 final_top_k 一致）")
     ap.add_argument("--no-save", action="store_true", help="不保存报告文件")
+    ap.add_argument("--max-per-doc", type=int, default=None,
+                    help="覆盖 hybrid.max_per_doc（0=不去重），用于 A/B 对比去重效果")
+    ap.add_argument("--sweep", nargs="?", const="auto", default=None,
+                    help="扫描 similarity_threshold：裸用 --sweep 会按实测可分区间自动取点；"
+                         "也可显式给逗号列表（注意某些 shell 下长列表会传参失败）")
     args = ap.parse_args()
     k = args.k
 
@@ -288,11 +394,30 @@ def main():
     if agent._bm25 is None:
         print("  ✗ BM25 索引未构建（hybrid.enabled 是否为 false？）")
         return 1
+
+    # --max-per-doc 覆盖要在打印 hybrid 配置之前生效，否则打印的是旧值
+    if args.max_per_doc is not None:
+        agent._hybrid_cfg["max_per_doc"] = args.max_per_doc
+        print(f"  ⚙ --max-per-doc 覆盖为 {args.max_per_doc}（0 = 不去重）")
+
     st = agent._bm25.stats()
     print(f"  ✓ {len(agent._corpus)} 个 chunk，词表 {st['vocab']}，"
           f"分词={'jieba' if st['jieba'] else 'bigram'}，耗时 {time.time() - t0:.1f}s")
     print(f"  相似度阈值={agent.similarity_threshold}  "
           f"hybrid 配置={json.dumps(agent._hybrid_cfg, ensure_ascii=False)}")
+    print(f"  候选池 rrf_candidates={RRF_CANDIDATES}（评测与生产同一条流水线）")
+
+    # 放在 agent 初始化之后，避免 [1/4] 的输出被 [1.5/4] 的标题截断（顺序错乱）
+    print("\n[1.5/4] 装载 Rerank 精排模型...")
+    global _RERANKER
+    _RERANKER = build_reranker()
+    if _RERANKER is not None:
+        rst = _RERANKER.stats()
+        print(f"  ✓ 精排就绪：{rst['resolved_path'] or rst['model']}"
+              f"  device={rst['device'] or 'auto'}  max_length={rst['max_length']}")
+        print(f"  生产配置 rerank={json.dumps(RAG_CONFIG.get('rerank') or {}, ensure_ascii=False)}")
+    else:
+        print("  ⚠ 精排不可用，本次只跑三路对比（这是降级，不是失败）")
 
     print(f"\n[2/4] 评测 {len(CASES)} 条标注 query（Top-{k}）...")
     modes = [
@@ -300,6 +425,8 @@ def main():
         ("纯 BM25", search_bm25),
         ("混合(RRF)", search_hybrid),
     ]
+    if _RERANKER is not None:
+        modes.append(("混合+Rerank", search_hybrid_rerank))
     results = {}
     for name, fn in modes:
         hit1, hitk, mrr, per_case = evaluate(agent, fn, k, CASES)
@@ -322,19 +449,42 @@ def main():
     neg_bm25 = [r["bm25_top"] for r in negs if r["bm25_top"] > 0]
 
     print(f"\n[4/4] 阈值标定参考")
+    rerank_calib = None      # 供报告段落使用
 
-    # ---- 向量路：阈值能否把负例挡在门外 ----
+    # ---- 向量路：阈值能否既挡住负例、又不切掉正例 ----
     neg_vec = [r["vector_top"] for r in negs]
-    print(f"\n  【向量路】阈值 = {agent.similarity_threshold}")
-    if agent.similarity_threshold is not None and neg_vec:
-        over = [r for r in negs if r["vector_top"] >= agent.similarity_threshold]
-        print(f"    负例最高余弦 = {max(neg_vec):.3f}")
-        if over:
-            print(f"    ⚠ 有 {len(over)} 条负例 >= 阈值，会被向量路放行：")
-            for r in over:
-                print(f"        {r['query']}  ({r['vector_top']:.3f})")
+    kd_vec = int(agent._hybrid_cfg.get("top_k_dense", 10))
+    pos_vec = positive_cosine_stats(agent, kd_vec)
+    own_vec = [r["own_max"] for r in pos_vec if r["own_max"] is not None]
+    cur_thr = agent.similarity_threshold
+
+    print(f"\n  【向量路】当前 similarity_threshold = {cur_thr}")
+    if neg_vec and own_vec:
+        print(f"    正例·期望文档最高余弦: {min(own_vec):.3f} ~ {max(own_vec):.3f}"
+              f"　（{len(own_vec)}/{len(CASES)} 条能取到，其余未进 top_k_dense={kd_vec}）")
+        print(f"    负例·Top-1 最高余弦  : {min(neg_vec):.3f} ~ {max(neg_vec):.3f}")
+        lo, hi = max(neg_vec), min(own_vec)
+        if hi > lo:
+            rec_v = lo + (hi - lo) * 0.5
+            print(f"    ✓ 可分！可分区间 ({lo:.3f}, {hi:.3f})，建议阈值 ≈ {rec_v:.3f}")
         else:
-            print(f"    ✓ {len(negs)} 条负例全部低于阈值，向量路的防幻觉过滤有效")
+            print(f"    ✗ 区间重叠（负例最高 {lo:.3f} >= 正例最低 {hi:.3f}），"
+                  f"单一余弦阈值无法两头兼顾")
+            print("      → 余弦阈值只能二选一：保正例召回 还是 挡负例。"
+                  "挡负例更适合交给精排闸门（见下方【精排路】）")
+        if cur_thr is not None:
+            margin = float(cur_thr) - max(neg_vec)
+            flag = "　⚠ 余量过小，防幻觉过滤已接近失效" if margin < 0.03 else ""
+            print(f"    当前阈值 {cur_thr} 距负例上限 {max(neg_vec):.3f} 的余量 = "
+                  f"{margin:+.3f}{flag}")
+            lost = [r["query"] for r in pos_vec
+                    if r["own_max"] is not None and r["own_max"] < float(cur_thr)]
+            if lost:
+                print(f"    ⚠ 有 {len(lost)} 条正例的期望文档最高余弦 < 当前阈值，会被切掉：")
+                for q in lost[:8]:
+                    print(f"        {q}")
+    else:
+        print("    数据不足，无法标定")
 
     # ---- BM25 路：绝对分数阈值能否分开 ----
     print(f"\n  【BM25 路】当前 min_bm25_score = {agent._hybrid_cfg.get('min_bm25_score')}")
@@ -353,6 +503,136 @@ def main():
                   f"或依赖上游意图识别把无关问题拦在 RAG 之前")
     else:
         print("    数据不足，无法标定")
+
+    # ---- 精排路：能否用精排分数分开正负例（替代失效的 BM25 绝对阈值）----
+    if _RERANKER is not None:
+        rcfg = RAG_CONFIG.get("rerank") or {}
+        print(f"\n  【精排路】mode = {rcfg.get('mode')}　"
+              f"score_threshold = {rcfg.get('score_threshold')}")
+        print("    口径：正例看**期望文档自己的最高分**（闸门要保住的就是它）；"
+              "负例看召回池最高分")
+
+        def _pools(q):
+            """一次召回同时取出 RRF 顺序的候选 + 各候选精排分（按 id 关联）。"""
+            rrf = search_hybrid(agent, q, RRF_CANDIDATES)
+            rr = search_hybrid_rerank(agent, q, RRF_CANDIDATES)
+            if not rr or _RERANKER.score_key not in rr[0]:
+                return rrf, None
+            return rrf, {h.get("id"): h[_RERANKER.score_key] for h in rr}
+
+        def _sim_gate(rrf, sid, thr):
+            """复刻 filter 模式语义：保持 RRF 顺序 → 按分数过滤 → 截断到 k。"""
+            if sid is None:
+                return None
+            return [h for h in rrf if sid.get(h.get("id"), -1.0) >= thr][:k]
+
+        # 单次遍历取齐；后面的统计与闸门验证全部复用，不再重复跑推理
+        pos_pool = [(q, expect) + _pools(q) for q, expect in CASES]
+        neg_pool = [(q,) + _pools(q) for q in NEGATIVE_CASES]
+
+        pos_exp = []
+        for _q, expect, rrf, sid in pos_pool:
+            if sid is None:
+                continue
+            exp = expected_set(expect)
+            own = [sid[h.get("id")] for h in rrf
+                   if h.get("id") in sid and source_of(h, agent._corpus) in exp]
+            if own:
+                pos_exp.append(max(own))
+
+        neg_top = [max(sid.values()) for _q, _rrf, sid in neg_pool if sid]
+
+        if pos_exp and neg_top:
+            print(f"    正例·期望文档最高分: {min(pos_exp):.3f} ~ {max(pos_exp):.3f}"
+                  f"　（{len(pos_exp)}/{len(CASES)} 条能取到）")
+            print(f"    负例·召回池最高分  : {min(neg_top):.3f} ~ {max(neg_top):.3f}")
+            lo, hi = max(neg_top), min(pos_exp)
+            if hi > lo:
+                rec = lo + (hi - lo) * 0.25        # 保守取法：先保正例召回
+                print(f"    ✓ 可分！建议 score_threshold ≈ {rec:.3f}"
+                      f"（可分区间 ({lo:.3f}, {hi:.3f})，中点 {(lo + hi) / 2:.3f}，"
+                      f"保守取 {rec:.3f}）")
+
+                kept_pos = sum(
+                    1 for _q, expect, rrf, sid in pos_pool
+                    if any(source_of(h, agent._corpus) in expected_set(expect)
+                           for h in (_sim_gate(rrf, sid, rec) or []))
+                )
+                blocked = sum(1 for _q, rrf, sid in neg_pool
+                              if not (_sim_gate(rrf, sid, rec) or []))
+                base_blocked = sum(1 for q in NEGATIVE_CASES
+                                   if not search_hybrid(agent, q, k))
+                print(f"    → 闸门实测（threshold={rec:.3f}）："
+                      f"正例保住 {kept_pos}/{len(CASES)}，"
+                      f"负例拦掉 {blocked}/{len(NEGATIVE_CASES)}"
+                      f"（不开精排时已拦 {base_blocked}/{len(NEGATIVE_CASES)}）")
+
+                rerank_calib = {
+                    "mode": rcfg.get("mode"),
+                    "threshold_cfg": rcfg.get("score_threshold"),
+                    "recommended": rec,
+                    "lo": lo, "hi": hi,
+                    "pos_min": min(pos_exp), "pos_max": max(pos_exp),
+                    "neg_min": min(neg_top), "neg_max": max(neg_top),
+                    "kept_pos": kept_pos, "blocked": blocked,
+                    "base_blocked": base_blocked,
+                }
+            else:
+                print(f"    ✗ 仍重叠（负例最高 {lo:.3f} >= 正例最低 {hi:.3f}）")
+                print("      → 说明 bge-reranker-base 对本语料的判别力不够，"
+                      "考虑升级 bge-reranker-v2-m3（但 CPU 延迟会显著上升）")
+        else:
+            print("    数据不足，无法标定")
+
+    # ---- similarity_threshold 扫描（放在标定之后，才能用上刚测出的可分区间）----
+    # 注意：必须放在【向量路】标定之后 —— 这里用到 kd_vec / own_vec / neg_vec / cur_thr，
+    # 提前到 [2/4] 之后会让它们成为"尚未赋值就被闭包引用"的 free variable（NameError）。
+    if args.sweep:
+        if str(args.sweep).strip().lower() == "auto":
+            cands = []
+            if own_vec and neg_vec:
+                lo_v, hi_v = max(neg_vec), min(own_vec)
+                if hi_v > lo_v:
+                    # 在实测可分区间上均分 5 点
+                    cands = [round(lo_v + (hi_v - lo_v) * f, 4)
+                             for f in (0.0, 0.25, 0.5, 0.75, 1.0)]
+            if not cands:
+                cands = [0.35, 0.40, 0.45, 0.50, 0.55]
+            if cur_thr is not None:
+                cands.append(float(cur_thr))
+            cands = sorted(set(cands))
+            print(f"\n  （--sweep auto：按可分区间自动取点）")
+        else:
+            try:
+                cands = [float(x) for x in str(args.sweep).split(",") if x.strip()]
+            except ValueError:
+                print(f"\n  ✗ --sweep 解析失败：{args.sweep}"
+                      f"（裸用 --sweep 即可自动取点）")
+                cands = []
+
+        if cands:
+            print(f"\n[4.5/4] similarity_threshold 扫描"
+                  f"（混合检索，max_per_doc={agent._hybrid_cfg.get('max_per_doc')}）...")
+            # 原始向量检索结果与阈值无关，只取一次复用（否则每个候选值都要重跑一遍）
+            raw_vec = {q: agent._vector_search(q, kd_vec) for q, _ in CASES}
+            saved_thr = agent.similarity_threshold
+            print(f"  {'阈值':<10}{'Hit@1':<12}{f'Hit@{k}':<12}{'MRR':<10}{'向量路平均条数'}")
+            print("  " + "-" * 58)
+            try:
+                for t in cands:
+                    agent.similarity_threshold = t
+                    n_vec = sum(
+                        len([d for d in raw_vec[q] if d["distance"] >= t])
+                        for q, _ in CASES
+                    ) / float(len(CASES))
+                    h1, hk, m, _ = evaluate(agent, search_hybrid, k, CASES)
+                    mark = "  ← 当前" if cur_thr is not None and abs(t - float(cur_thr)) < 1e-9 else ""
+                    print(f"  {t:<10.4f}{h1}/{len(CASES):<9}{hk}/{len(CASES):<9}"
+                          f"{m:<10.3f}{n_vec:.1f}{mark}")
+            finally:
+                agent.similarity_threshold = saved_thr
+            print(f"  生产阈值仍为 {saved_thr}（扫描只改内存，未写回 config.py）")
+            print("  判定：挑 Hit@3 最高、其次 MRR 最高的那一行写进 config.py")
 
     # ---- 报告 ----
     print("\n" + "=" * 78)
@@ -435,8 +715,27 @@ def main():
             lines.append(f"- 负例 BM25 最高分: {min(neg_bm25):.2f} ~ {max(neg_bm25):.2f}")
             lo, hi = max(neg_bm25), min(pos_bm25)
             lines.append(f"- 可分区间: {'({:.2f}, {:.2f})'.format(lo, hi) if hi > lo else '重叠，无法用绝对阈值分开'}")
+
+        lines += ["", "## Rerank 精排标定（score_threshold 的来源）", ""]
+        if rerank_calib:
+            c = rerank_calib
+            lines += [
+                f"- 生产配置 mode: `{c['mode']}`　score_threshold: `{c['threshold_cfg']}`",
+                f"- 正例·期望文档最高分: {c['pos_min']:.3f} ~ {c['pos_max']:.3f}",
+                f"- 负例·召回池最高分: {c['neg_min']:.3f} ~ {c['neg_max']:.3f}",
+                f"- 可分区间: ({c['lo']:.3f}, {c['hi']:.3f})"
+                f"　→ 建议 `score_threshold = {c['recommended']:.3f}`（保守取法，先保正例召回）",
+                f"- 闸门实测（threshold={c['recommended']:.3f}）: "
+                f"正例保住 {c['kept_pos']}/{len(CASES)}，"
+                f"负例拦掉 {c['blocked']}/{len(NEGATIVE_CASES)}"
+                f"（不开精排时已拦 {c['base_blocked']}/{len(NEGATIVE_CASES)}）",
+            ]
+        else:
+            lines.append("精排未启用或分数无法分开正负例，本次未产出建议阈值。")
+
         lines += ["", "## 检索明细", "",
-                  f"| query | 期望文档 | 纯向量 | 纯BM25 | 混合 |", "|---|---|---|---|---|"]
+                  "| query | 期望文档 | " + " | ".join(n for n, _ in modes) + " |",
+                  "|---" * (2 + len(modes)) + "|"]
         for i, (query, expect) in enumerate(CASES):
             cells = []
             for name, _ in modes:

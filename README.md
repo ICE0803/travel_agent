@@ -103,6 +103,7 @@
 | 用户偏好记忆准确率 | - | 95% | 智能识别追加/覆盖 |
 | 系统响应时间 | 30 秒（串行） | 15 秒（优先级并行） | 同优先级 Agent 并行执行 |
 | 系统启动速度 | 未优化 | 快 | 懒加载 + 渐进式披露 |
+| RAG 负例拦截（6 条不该命中的 query） | 1/6 | **6/6** | Cross-Encoder 精排当闸门（`score_threshold=0.264`），正例保住 52/53；**代价 +2.6s/次** |
 | 缓存命中率 | - | `status` 实时查看 | Redis 偏好 / 总结命中计数（会话内累计值） |
 
 **优化路径**：
@@ -111,6 +112,7 @@
 3. **V3.0**：LLM 语义理解意图识别 + 优先级并行调度
 4. **V4.0**：Skill Plugins 插件化架构 + LazyAgentRegistry + 懒加载
 5. **V5.0**：PostgreSQL 长期记忆 + Redis 缓存层（Write-Through / Lazy Loading / watermark 防脏读）
+6. **V6.0**：混合检索（BM25 + RRF）+ Rerank 精排闸门 + 修正 Embedding 池化（mean → CLS）+ 同文档限流，检索指标全部重测（含两个被实测否掉的调优假设）
 
 ---
 
@@ -168,7 +170,9 @@
    │            └─ similarity_threshold=0.5 过滤（只作用于这一路）
    └─ BM25 路：jieba 分词 → Okapi BM25 → top_k_sparse=10
                         ↓
-              RRF 融合（k=60）→ 取 final_top_k=3
+              RRF 融合（k=60，dense:sparse = 1:1.5）→ 保留 rrf_candidates=10 条候选池
+                        ↓
+        精排闸门（可选，mode="filter"）→ 取 final_top_k=3
 ```
 
 用 RRF 而非加权求和：BM25 分数无上界、余弦在 -1~1，**量纲不同**无法直接加权；RRF 只看排名（`RRF(d) = Σ 1/(k + rank)`），天然规避该问题。
@@ -176,15 +180,136 @@
 > ⚠️ 一个容易踩的坑：`similarity_threshold=0.5` 是给**余弦分数**用的，而 RRF 分数只有 `0.008~0.03` 量级。
 > 直接套用会**把所有结果过滤光**，系统永远回答「知识库中没有相关信息」。所以阈值只作用于向量路，BM25 单路命中走独立的 `min_bm25_score`。
 
-**实测**（`scripts/eval_retrieval.py`，53 条标注 query + 6 条负例，Top-3）：
+**实测**（`scripts/eval_retrieval.py`，53 条标注 query + 6 条负例，Top-3，`max_per_doc=0`、`similarity_threshold=0.51`、`dense:sparse=1:1.5`）：
 
 | 检索模式 | Hit@1 | Hit@3 | MRR |
 |---|---|---|---|
-| 纯向量 | 44/53 | 48/53 | 0.865 |
+| 纯向量 | 45/53 | 50/53 | 0.893 |
 | 纯 BM25 | 46/53 | 53/53 | 0.928 |
-| **混合（RRF）** | **49/53** | **53/53** | **0.959** |
+| 混合（RRF） | **50/53** | **51/53** | **0.953** |
+| 混合 + Rerank 重排 | **50/53** | 52/53 | **0.959** |
 
-混合检索三项指标均最优，Hit@3 相对纯向量补齐全部漏召。分词优先 jieba（未装则降级字符二元组）+ 停用词过滤；参数见 `config.py` → `RAG_CONFIG["hybrid"]`，实现见 `utils/hybrid_retriever.py`。
+分词优先 jieba（未装则降级字符二元组）+ 停用词过滤；参数见 `config.py` → `RAG_CONFIG["hybrid"]`，实现见 `utils/hybrid_retriever.py`。
+
+> ⚠️ **这组数字是修正 Embedding 池化之后重测的**（详见「注意事项 → Embedding 池化」）。修正后纯向量明显变好（MRR 0.865→0.893、Hit@3 48→50），**但混合检索的 Hit@3 掉到 51/53，低于纯 BM25 的 53/53**。2 条失败用例的期望文档**根本没进候选前列**：
+>
+> | 失败用例 | 期望文档 | 实际 Top-3 |
+> |---|---|---|
+> | 国际长途航班可以订什么舱位 | `01_travel_standards.txt` | `03_booking_guide.txt`、`10_international_travel.txt`、`03_booking_guide.txt` |
+> | 紧急出差可以后补审批吗 | `12_seasonal_policies.txt` | `04_faq.txt`、`04_faq.txt`、`04_faq.txt` |
+>
+> 也就是说这是 **RRF 排序本身**的问题，不是"重复占位挤掉了正确文档"——后者已被下面的去重实验证伪：把重复项去掉换成其他文档之后，期望文档依然排不进前 3。
+
+#### RRF 通道权重：能改善排名质量，救不了 Hit@3
+
+原来的 RRF 是**等权**融合，但实测暴露了一个反直觉的事实：
+
+```
+纯 BM25        Hit@1=46/53  Hit@3=53/53  MRR=0.928
+混合(RRF)      Hit@1=49/53  Hit@3=51/53  MRR=0.943
+```
+
+**单靠 BM25 的 Hit@3 是满分 53/53，把向量路加进来做等权 RRF 反而掉了 2 条** —— 说明关键词路的排序更准、被向量路稀释了。`reciprocal_rank_fusion()` 本来就支持 `weights`，只是原实现一直传等权：
+
+```python
+RRF(d) = w_dense/(k + rank_dense(d)) + w_sparse/(k + rank_sparse(d))
+```
+
+只有**比值**有意义（两侧同比例放大等于没变）。用 `scripts/tune_rrf_weights.py` 扫描：
+
+| dense:sparse | Hit@1 | Hit@3 | MRR |
+|---|---|---|---|
+| 1:1（原等权） | 49/53 | 51/53 | 0.943 |
+| **1:1.5（当前）** | **50/53** | 51/53 | **0.953** |
+| 1:2 | 49/53 | 51/53 | 0.943 |
+| 1:3 | 47/53 | 51/53 | 0.925 |
+| 1:5 | 47/53 | 51/53 | 0.925 |
+| 1:10 | 46/53 | 51/53 | 0.915 |
+
+细扫（`--fine 1.5`）显示 **1:1.05 / 1.275 / 1.5 / 1.725 / 1.95 五组的指标完全相同** —— 是个平台而不是尖峰，所以取平台居中值 `1.5` 留鲁棒余量。
+
+**两个必须说清楚的要点：**
+
+1. **Hit@3 全程 51/53，一位不动。** 加权救不了那 2 条失败用例——它们的期望文档是"根本没进候选前列"，不是"排名差点意思"。所以加权改善的是 **Hit@1 / MRR（排名质量）**，不是召回能力。
+2. **±1 条已在噪声区间。** 指标对权重呈**台阶状**（权重微调会让某条 query 的并列关系翻转），1:2 就掉回基线。采用它的依据是"在一个足够宽的平台上三项指标**都不劣于**基线"，而不是"更好"。
+
+#### 检索调优实验记录（含两个被实测否掉的假设）
+
+> 把试过但**实测无效**的两条路也记下来：它们各自排除了一个看似合理的猜测。对一个检索系统来说，"哪个旋钮拧不动"和"哪个拧得动"一样重要。
+
+**假设 1：换 embedding 后余弦分数抬高、`similarity_threshold` 失配 → 否掉。**
+
+CLS 确实系统性抬高了余弦（6 条负例里 5 条 Top-1 余弦上升，如「今天天气」0.435→0.482；负例上限距阈值 0.5 的安全余量从 0.065 掉到 0.018，接近失效）。但 `--sweep` 扫描证明**阈值在可分区间内怎么取都完全等价**：
+
+| similarity_threshold | Hit@1 | Hit@3 | MRR | 向量路平均条数 |
+|---|---|---|---|---|
+| 0.4824 | 49/53 | 51/53 | 0.943 | 9.2 |
+| 0.4956 | 49/53 | 51/53 | 0.943 | 8.9 |
+| **0.5000（原值）** | 49/53 | 51/53 | 0.943 | 8.8 |
+| 0.5090 | 49/53 | 51/53 | 0.943 | 8.6 |
+| 0.5220 | 49/53 | 51/53 | 0.943 | 8.4 |
+| 0.5353 | 49/53 | 51/53 | 0.943 | 8.1 |
+
+> 该表在 **RRF 等权（1:1）** 时测得，绝对值与当前默认（1:1.5）略有差异，但"阈值不影响指标"的结论与权重无关。
+
+阈值确实在过滤（向量路候选 9.2 → 8.1 条），但**指标一点不动**。结论：阈值只能用来留安全余量，调不出精度。当前取 `0.51`（≈实测可分区间 (0.482, 0.535) 的中点，两侧余量最均衡）。
+
+**假设 2：Top-3 被同文档 chunk 占满，按 `parent_doc` 去重就能修好 → 否掉。**
+
+`max_per_doc=1` 确实生效了（失败的 Top-3 从 `03_booking_guide ×2` 变成 3 篇不同文档），但**指标纹丝不动，精排那一列还变差了**：
+
+| 配置 | 混合(RRF) Hit@1/Hit@3/MRR | 混合+精排重排 Hit@1/Hit@3/MRR | 精排闸门（正例/负例） |
+|---|---|---|---|
+| `max_per_doc=1` | 49 / 51 / 0.943 | **47 / 52 / 0.928** | 52/53 · 6/6 |
+| `max_per_doc=0`（默认） | 49 / 51 / 0.943 | **49 / 53 / 0.956** | 52/53 · 6/6 |
+
+> 该表在 **RRF 等权（1:1）** 时测得（用 `--max-per-doc` A/B 对比得出）。换权重后绝对值会上移（当前默认 1:1.5 下 混合(RRF) 是 50/51/0.953），但"去重对混合指标中性"的结论有理论保证、与权重无关。
+
+去重对指标**中性**这件事有理论解释，不只是实测巧合：去重保留每篇文档**首次出现**的位置，只把重复槽位换成排名更靠后的**其他**文档 —— 期望文档的名次因此不变。所以 Hit@k / MRR 只会不变或变好，永远不会变差；那 2 条失败用例之所以不变，是因为期望文档连"前 3 篇不同文档"都排不进（见上面的失败明细）。
+
+但它会拉低「精排重排」：候选池从"若干篇文档的 10 个 chunk"变成"10 篇不同文档"，精排多了更弱但更杂的候选来争夺 Top-3，反而把正确的挤下去。**`max_per_doc` 与 `rerank.mode="rerank"` 是冲突的**（默认 `rerank.enabled=False`，生产不受影响）。
+
+**结论：默认设为 `0`（关闭）。** 立项前提（"重复占位把正确文档挤出去"）已被证伪，而开启它拿不到任何指标收益，还会把 RRF 第 4~6 名的更弱文档塞进 prompt 稀释上下文（实测「国际长途航班可以订什么舱位」被塞进 `05_emergency_procedures.txt`）。函数 `limit_per_doc()` 与配置项保留，定位是"想要文档多样性时才打开的实验开关"。
+
+#### Rerank 精排：定位是「相关性闸门」
+
+在 RRF 融合后接一个 Cross-Encoder（`bge-reranker-base`，本地部署）做二次打分。
+
+**它的排序收益不稳定**——同一个组件在三种配置下符号翻来覆去，所以默认不拿它排序：
+
+| 配置 | 混合(RRF) Hit@3 / MRR | 混合+精排重排 Hit@3 / MRR | 精排重排净效果 |
+|---|---|---|---|
+| 旧：mean 池化 + 不去重 + 等权 | 53/53 / 0.959 | 52/53 / 0.950 | 负收益（−1 / −0.009） |
+| cls 池化 + 不去重 + 等权 | 51/53 / 0.943 | 53/53 / 0.956 | 正收益（+2 / +0.013） |
+| cls 池化 + 去重 + 等权（`max_per_doc=1`） | 51/53 / 0.943 | 47/53 / 0.928 | **负收益**（−4 / −0.015） |
+| cls 池化 + 不去重 + 权重 1:1.5（**当前默认**） | 51/53 / 0.953 | 52/53 / 0.959 | 近似中性（−1 / +0.006） |
+
+根因是它**缺少稳定的判别信号** —— 分数饱和：
+
+| 用例 | 精排 Top-3 分数 |
+|---|---|
+| 跨年度出差什么时候必须完成报销 | 0.9932 / 0.9895 / 0.9712 |
+| 国际机票建议提前多久预订 | 0.9948 / 0.9915 / 0.9846 |
+| 报销需要准备哪些材料 | 0.9675 / 0.9254 / 0.8659 |
+
+12 篇文档高度重叠（`10_international_travel.txt` 自己就有「报销凭证」「报销标准」整节），任何差旅问题都有一堆片段**确实相关**，精排一视同仁给 0.86~0.99，排序接近抛硬币。
+
+> ⚠️ 53 条样本上 ±2 条已接近噪声区间，**不足以断言精排更好或更差**。能确定的是：**精排的排序表现不能脱离 embedding 与候选池构成单独评价**，所以这里不用它排序。
+
+**而不管排序表现如何，精排分数做准入判断一直很稳**，正好补上 `min_bm25_score` 那个「区间重叠、无法分开」的窟窿：
+
+| 口径 | 分数区间 |
+|---|---|
+| 正例 · 期望文档自己的最高分 | 0.313 ~ 1.000 |
+| 负例 · 召回池最高分 | 0.000 ~ 0.247 |
+
+可分区间 **(0.247, 0.313)**，保守取 `score_threshold = 0.264`。闸门实测：**负例拦掉 6/6**（不开精排时 6 条只拦掉 1 条），正例保住 52/53 —— 丢的那条不是卡在阈值上，而是过滤后按 RRF 顺序截断到 3 条时被挤掉的（又是重复占位）。
+
+所以默认配置是 `mode: "filter"` —— **排序仍然交给 RRF，精排只负责丢掉低相关片段**；`mode: "rerank"` 保留纯重排行为用于 A/B 对比。实现见 `utils/reranker.py`，标定结果会写进 `tests/results/retrieval_eval_*.md` 的「Rerank 精排标定」一节。
+
+> ⚠️ **延迟代价（实测）**：`scripts/bench_rerank.py` 在纯 CPU 上测得单次精排**中位数 2.61 秒**（候选 10 条 × 平均 547 字；最小 1.52s / 最大 2.96s），模型载入 2.56s。这笔开销**每轮 RAG 问答都要付**，而且与最终返回 3 条无关——精排必须对整个候选池打分。`mode="filter"` 且未设 `score_threshold` 时会**直接跳过精排**，不产生任何延迟（默认配置就是这个状态）。
+>
+> 开闸门之前先算一下 ROI：6 条负例里真正会走到 RAG 技能的本来就不多（`今天天气怎么样` 这类会被意图识别分给 `query-info`），**用 2.6 秒换 5 条负例的拦截**值不值需要自己判断。想压延迟可以调小 `RAG_CONFIG["hybrid"]["rrf_candidates"]`（实测候选池常常只有 6~10 条）或 `rerank.max_length`，但每次都要回跑评测确认精度没掉。
 
 ### 4. 信息查询（联网搜索）
 
@@ -282,7 +407,23 @@ python scripts/migrate_json_to_pg.py
 python .claude/skills/ask-question/script/init_knowledge_base.py
 ```
 
-### 7. 启动系统
+### 7. （可选）下载 Rerank 精排模型
+
+`RAG_CONFIG["rerank"]["enabled"]` 默认为 `False`，不开精排可以跳过这一步。但 `scripts/eval_retrieval.py` 的第 4 列（混合+Rerank）和【精排路】阈值标定需要它。
+
+```bash
+python scripts/download_reranker.py     # 约 1.06 GB → data/models/bge-reranker-base/
+```
+
+网络受限时先设镜像（注意 Windows 下 `setx` 不会注入已运行的进程）：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com          # Windows: $env:HF_ENDPOINT="https://hf-mirror.com"
+```
+
+模型缺失时精排会**静默降级**为 RRF 顺序（日志里能看到 `Rerank 不可用：本地模型目录不存在`），功能不中断。
+
+### 8. 启动系统
 
 ```bash
 python cli.py
@@ -339,16 +480,31 @@ python tests/test_cli_qa.py
 
 ### 单元 / 模块测试
 ```bash
-python tests/test_hybrid_retriever.py   # 混合检索（分词/停用词/BM25/RRF，离线可跑）
+python tests/test_hybrid_retriever.py   # 混合检索（分词/停用词/BM25/RRF/同文档限流，离线可跑）
+python tests/test_reranker.py           # Rerank 精排（三模式/降级/阈值过滤，离线可跑）
 python tests/test_search_backend.py     # 网络搜索后端回退编排（离线可跑）
 python tests/test_memory_system.py      # 记忆系统
 python tests/test_intention_agent.py    # 意图识别
 python tests/test_information_query_agent.py  # 信息查询（天气/搜索，需联网）
 ```
 
-> `test_hybrid_retriever.py` 与 `test_search_backend.py` **不依赖网络、Milvus 和 API Key**，
-> 可直接在 CI 里跑。前者在 jieba 装了或没装的环境下都能通过（分词用例按后端分支断言，
-> 并额外强制走一遍 bigram 降级路径）。
+> `test_hybrid_retriever.py`、`test_reranker.py` 与 `test_search_backend.py` **不依赖网络、Milvus、模型文件和 API Key**，可直接在 CI 里跑。
+> 前者在 jieba 装了或没装的环境下都能通过（分词用例按后端分支断言，并额外强制走一遍 bigram 降级路径）；
+> `test_reranker.py` 通过 `scorer` 参数注入假打分器，因此不需要那 1 GB 的精排模型也能覆盖全部分支，
+> 包括「降级时绝不能用阈值过滤」这条防误伤规则。
+
+### 检索效果评测
+
+```bash
+python scripts/eval_retrieval.py                       # 四路对比 + 各项阈值标定（会存档报告到 tests/results/）
+python scripts/eval_retrieval.py --sweep               # 额外扫描 similarity_threshold（按实测可分区间自动取点）
+python scripts/eval_retrieval.py --max-per-doc 1       # A/B 对比同文档限流（默认 0 = 关闭）
+python scripts/tune_rrf_weights.py                     # RRF 通道权重扫描（约 6 秒）
+python scripts/tune_rrf_weights.py --fine 1.5          # 在候选权重附近细扫，确认峰/平台够宽
+```
+
+> `--sweep` 用**裸参**是有意的：某些 Windows shell 下传 6 个以上的逗号分隔浮点数会导致进程创建失败。
+> 显式列表仍可用（如 `--sweep 0.45,0.5`），但长列表建议直接编辑脚本里的默认候选。
 
 ---
 
@@ -379,13 +535,22 @@ travel_agent/
 │   └── long_term_memory.py          # 长期记忆（PostgreSQL + 偏好 Write-Through 缓存）
 ├── scripts/
 │   ├── init_db.py                   # 建表（幂等）
-│   └── migrate_json_to_pg.py        # 历史 JSON 记忆迁移到 PostgreSQL
+│   ├── migrate_json_to_pg.py        # 历史 JSON 记忆迁移到 PostgreSQL
+│   ├── eval_retrieval.py            # 检索效果评测（纯向量/纯BM25/混合/混合+精排 + 阈值标定）
+│   ├── tune_rrf_weights.py          # RRF 通道权重扫描（dense:sparse）
+│   ├── bench_rerank.py              # Rerank 延迟实测（CPU）
+│   ├── download_reranker.py         # 下载 bge-reranker-base 到 data/models/
+│   └── check_search_api.py          # 网络搜索后端逐通道自检
 ├── data/
 │   ├── memory/                      # 历史 JSON 记忆（降级模式使用）
-│   ├── memory_bak/                  # 迁移前备份
-│   └── models/bge-small-zh-v1.5/    # 本地 Embedding 模型
+│   ├── test_memory/                 # 记忆系统测试数据（tests/test_memory_system.py 使用）
+│   └── models/                      # 本地模型（.gitignore 忽略，需自行下载）
+│       ├── bge-small-zh-v1.5/       #   Embedding 模型
+│       └── bge-reranker-base/       #   Rerank 精排模型（可选，见快速开始第 7 步）
 ├── tests/                           # 测试脚本
 ├── utils/                           # 工具与连接可用性
+│   ├── hybrid_retriever.py          # 分词（jieba/降级）+ BM25 + RRF 融合
+│   ├── reranker.py                  # Rerank 精排（Cross-Encoder，三模式 + 降级安全）
 │   ├── circuit_breaker.py           # 熔断器
 │   ├── llm_resilience.py            # 重试退避、健康检查
 │   ├── json_parser.py               # 鲁棒 JSON 解析
@@ -419,6 +584,7 @@ travel_agent/
 - 🔤 **jieba** - 中文分词（BM25 关键词路；未安装时降级为字符二元组）
 - 📊 **Okapi BM25** - 关键词路打分（`k1=1.5, b=0.75`）
 - 🔀 **RRF（Reciprocal Rank Fusion）** - 双路融合排序（`k=60`）
+- 🎯 **bge-reranker-base** - Cross-Encoder 精排（本地部署；在 RRF 之后当**相关性闸门**用，而非重排）
 
 ### 联网与搜索
 - 🌐 **wttr.in** - 天气查询（免费）
@@ -466,6 +632,27 @@ travel_agent/
 - 向量库文件：`.claude/skills/ask-question/data/rag_knowledge/milvus_lite.db`
 - 若使用 `pymilvus 3.x`，需在 `search_knowledge()` 中先调用 `load_collection()` 再检索（代码已处理）
 
+### Embedding 池化
+- `bge-small-zh-v1.5` 用的是 **CLS 池化**（模型自带 README 写得很明确：`Perform pooling. In this case, cls pooling.`）
+- 如果模型目录缺 `modules.json` / `1_Pooling/config.json`，`sentence-transformers` 会**静默降级成 mean pooling**，只在 stderr 打一行 `Creating a new one with mean pooling` —— 没有任何报错，症状只是「检索变差」，极易长期潜伏。本项目就踩过：修正后纯向量 MRR 0.865→0.893、Hit@3 48→50
+- 本地模型目录（`data/models/`）被 `.gitignore` 忽略，重新部署时**必须**从官方仓库完整拉取。若已残缺，只补非权重文件即可（权重 95MB 不必重下）：
+  ```python
+  from huggingface_hub import snapshot_download
+  snapshot_download("BAAI/bge-small-zh-v1.5", local_dir="data/models/bge-small-zh-v1.5",
+                    ignore_patterns=["*.safetensors", "*.bin", "*.onnx", "*.h5"])
+  ```
+- **改完池化必须重建向量库**：`python .claude/skills/ask-question/script/init_knowledge_base.py`。否则库里是 mean 池化算出来的向量、查询侧是 CLS，两侧不在同一向量空间，余弦相似度失去意义
+- `RAGKnowledgeAgent` 启动时会自检池化方式，不是 `cls` 就直接打 `ERROR` 日志（`agent.py` 里的「自检：BGE 必须用 CLS 池化」）
+- 同类残留：`tokenizer_config_20260314_215708.json` 是早期手工下载的改名残留，官方 `tokenizer_config.json` 已补齐，该文件可删
+
+### Rerank 精排
+- 模型 `data/models/bge-reranker-base/`（约 1.06 GB）**不入库**（`.gitignore` 忽略了 `data/models/`），clone 下来必须跑 `python scripts/download_reranker.py`
+- 缺模型 / 缺依赖 / 打分异常都会**静默降级**为 RRF 顺序，功能不中断（日志里能看到原因）
+- `mode: "filter"` 时**必须设 `score_threshold`**，否则精排会被直接跳过（零开销、也没有效果）。阈值用 `python scripts/eval_retrieval.py` 的【精排路】标定，当前实测建议 `0.264`
+- `hybrid.max_per_doc=1`（开启同文档去重）会**拉低** `mode="rerank"`（候选池变成"10 篇不同文档"，精排被更杂的候选带偏，实测 Hit@1 49→47）。该项默认已关闭（`0`）
+- 延迟实测中位数 **2.61s/次**（`python scripts/bench_rerank.py`）。调小 `--candidates` / `--max-length` 可降延迟，但要用评测确认精度没掉
+- `max_length` 上限是 512（模型 `max_position_embeddings: 514`），而 chunk 上限 600 字符 → 长 chunk 会被截断
+
 ### 网络搜索配置（多后端可插拔）
 - 后端由 `config.py` 的 `SEARCH_CONFIG` 控制：`backend` 可选 `auto | tavily | ddgs`，`auto_order` 决定尝试顺序。`auto` 会依次尝试、任一成功即用；未配置 / 超时 / 配额用尽 / 返回 0 条都会自动换下一个。
 - **后端对比**：
@@ -474,6 +661,21 @@ travel_agent/
   |------|------|----------|------|
   | **Tavily** ⭐ | `TAVILY_API_KEY` | 1000 credits/月 | **主通道**。返回抽取好的正文，适合 RAG；控制台 <https://app.tavily.com> |
   | DDGS | 无需 Key | 无限制 | 兜底通道。抓取公开页面，零配置；实测部分后端已失效，较脆弱 |
+
+- **DDGS 的 `backends` 列表要用自检脚本实测后再填**，而且它**是间歇性的**——本项目连测 5 次的样本（`scripts/check_search_api.py`）：
+
+  | 后端 | 5 次中可用 | 失败形态 |
+  |------|-----------|----------|
+  | `bing` | 4/5 | `TimeoutException`（间歇） |
+  | `auto` | 4/5 | `TimeoutException`（间歇） |
+  | `yandex` | 4/5 | `DDGSException`（间歇） |
+  | `duckduckgo` | 0/1 | `DDGSException`（**稳定失败**） |
+
+  前三个都是**间歇超时**而不是彻底失效；三个串起来的累计成功率 ≈ 1−0.2³ ≈ **99%**。而 `duckduckgo` 是稳定失败，留在列表里只会白撞一次、白付一次超时。
+
+  原配置 `["bing","duckduckgo","auto"]` 正是这种情况——塞着稳定失效的 duckduckgo，却没有可用的 yandex。现改为 `["bing","auto","yandex"]`。
+
+  > ⚠️ 抓取后端会随上游反爬策略随时变化，**换环境、或发现兜底明显变慢时，重跑一次自检再决定顺序**。别看某一轮的结论就当定论（我第一次测出的是「bing✓ yandex✓」，几分钟后复测两者都超时了）。
 
 - **Key 直接写进 `config.py`**（该文件已被 `.gitignore` 忽略，Key 不会进仓库）：
   ```python
@@ -491,8 +693,12 @@ travel_agent/
 - [x] ~~网络搜索主通道接入 Tavily~~（已完成：`query-info` 技能，DDGS 自动兜底）
 - [ ] 缓存命中率的独立基准测试（冷启动 / 多会话场景，目前 `status` 显示的是会话内累计值）
 - [x] ~~多路召回（向量 + BM25 混合检索）~~（已完成：`utils/hybrid_retriever.py` + RRF 融合）
-- [ ] Rerank 精排（在 RRF 融合后接一个 Cross-Encoder 重排，进一步提升精度）
-- [x] ~~检索效果评测脚本~~（已完成：`scripts/eval_retrieval.py`，36 条标注 query + 6 条负例，输出 Hit@k / MRR 对比报告）
+- [x] ~~Rerank 精排~~（已完成：`utils/reranker.py`。实测**重排**在本语料上是负收益（分数饱和，Hit@3 53→52），改为当**相关性闸门**用 —— 正例保住 53/53、负例拦掉 6/6）
+- [ ] Rerank 排序路线的后续优化（当前只当闸门用）：同文档 chunk 分数聚合、每 query 归一化后与 RRF 加权融合、缩短 chunk 以避开 512 token 截断（`bge-reranker-base` 是 XLM-RoBERTa，上限 514）
+- [x] ~~检索结果按 `parent_doc` 去重~~（已完成并**默认关闭**：`hybrid.max_per_doc=0`。立项前提"重复占位挤掉正确文档"被实测证伪；去重对 Hit@k / MRR **完全中性**（保留每篇文档首次出现的位置，期望文档名次不变），却会拉低精排重排、并把 RRF 第 4~6 名的更弱文档塞进 prompt。代码与用例保留作实验开关）
+- [x] ~~RRF 通道权重~~（已完成：`hybrid.dense_weight` / `sparse_weight`，当前 `1:1.5`。实测平台 1:1.05~1:1.95，改善 Hit@1（49→50）与 MRR（0.943→0.953），**但 Hit@3 全程 51/53 不变**）
+- [ ] **混合检索的 Hit@3 仍是 51/53，低于纯 BM25 的 53/53** —— 已排除三个假设：重复占位（去重实测中性）、阈值失配（0.482~0.535 指标全等）、通道权重（1:1~1:10 的 Hit@3 全程不变）。剩下值得查的方向：`min_bm25_score` 准入策略（README 早前提到的"至少命中 N 个查询实词"）、query 改写质量、以及**为何向量路会把正确文档挤下去**（可逐条对比两路的原始排名）
+- [x] ~~检索效果评测脚本~~（已完成：`scripts/eval_retrieval.py`，53 条标注 query + 6 条负例，输出 Hit@k / MRR 对比 + 精排阈值标定报告）
 - [ ] 支持更多 LLM / 切换模型
 - [ ] Web 界面（FastAPI + React）
 - [ ] 更多 Skill 插件（酒店预订、机票查询等）

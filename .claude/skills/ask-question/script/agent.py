@@ -48,13 +48,23 @@ except ImportError as e:
 
 # 混合检索（BM25 + RRF）。导入失败时自动退回纯向量检索，不影响主流程。
 try:
-    from utils.hybrid_retriever import BM25Index, reciprocal_rank_fusion
+    from utils.hybrid_retriever import BM25Index, limit_per_doc, reciprocal_rank_fusion
     HYBRID_AVAILABLE = True
 except ImportError as e:  # pragma: no cover
     BM25Index = None
     reciprocal_rank_fusion = None
     HYBRID_AVAILABLE = False
     logger.warning(f"混合检索模块不可用，将退回纯向量检索: {e}")
+
+# Rerank 精排（可选）。导入失败时自动跳过精排，混合检索仍可用。
+try:
+    from utils.reranker import CrossEncoderReranker, apply_rerank
+    RERANK_AVAILABLE = True
+except ImportError as e:  # pragma: no cover
+    CrossEncoderReranker = None
+    apply_rerank = None
+    RERANK_AVAILABLE = False
+    logger.warning(f"Rerank 模块不可用，将退回 RRF 顺序: {e}")
 
 
 class RAGKnowledgeAgent(AgentBase):
@@ -125,6 +135,33 @@ class RAGKnowledgeAgent(AgentBase):
         self.embedding_model = SentenceTransformer(model_path_or_id)
         self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
 
+        # ---- 自检：BGE 必须用 CLS 池化 ----
+        # 模型目录缺 modules.json / 1_Pooling/config.json 时，sentence-transformers 会
+        # **静默降级为 mean pooling**（只在 stderr 打一行 "Creating a new one with mean
+        # pooling"）。症状仅仅是"检索质量变差"，没有任何报错，极易长期潜伏——
+        # 本项目已经踩过一次，所以启动时显式检查并打 ERROR。
+        self.embedding_pooling = None
+        try:
+            _pooling = self.embedding_model[1]
+            if getattr(_pooling, "pooling_mode_cls_token", False):
+                self.embedding_pooling = "cls"
+            elif getattr(_pooling, "pooling_mode_mean_tokens", False):
+                self.embedding_pooling = "mean"
+            else:
+                self.embedding_pooling = "other"
+            if self.embedding_pooling == "cls":
+                logger.info("Embedding 池化自检通过：cls")
+            else:
+                logger.error(
+                    "Embedding 池化方式异常：期望 cls，实际 %s（模型：%s）。"
+                    "通常是因为模型目录缺 modules.json / 1_Pooling/config.json，"
+                    "BGE 会被降级成 mean pooling，检索会变差但不报错。"
+                    "修复：用 huggingface_hub 只拉非权重文件补齐配置，然后重建向量库。",
+                    self.embedding_pooling, model_path_or_id,
+                )
+        except Exception as e:
+            logger.warning(f"Embedding 池化自检跳过（无法读取模块结构）: {e}")
+
         # 初始化 Milvus Lite（本地文件存储）
         milvus_db_path = str(self.knowledge_base_path / "milvus_lite.db")
         logger.info(f"Initializing Milvus Lite at: {milvus_db_path}")
@@ -168,6 +205,40 @@ class RAGKnowledgeAgent(AgentBase):
             logger.warning("配置要求混合检索，但 hybrid_retriever 不可用")
         else:
             logger.info("混合检索未启用（hybrid.enabled=False），使用纯向量检索")
+
+        self._rerank_cfg: Dict = {}
+        self._reranker = None
+        try:
+            from config import RAG_CONFIG as _RAG_CFG_RERANK
+            self._rerank_cfg = (_RAG_CFG_RERANK.get("rerank") or {})
+        except Exception as e:
+            logger.warning(f"读取 RAG_CONFIG['rerank'] 失败，使用默认值: {e}")
+            self._rerank_cfg = {}
+
+        if self._rerank_cfg.get("enabled"):
+            if not RERANK_AVAILABLE:
+                logger.warning("配置要求 Rerank，但 utils.reranker 不可用，跳过精排")
+            elif not (self._hybrid_cfg or {}).get("enabled"):
+                # 明确暴露误配置：精排是混合检索的上游增强，纯向量路径不接精排
+                logger.warning(
+                    "Rerank 仅作用于混合检索路径，但 hybrid.enabled=False，精排不会生效"
+                )
+            else:
+                self._reranker = CrossEncoderReranker(
+                    model_name_or_path=self._rerank_cfg.get("model"),
+                    device=self._rerank_cfg.get("device"),
+                    batch_size=int(self._rerank_cfg.get("batch_size", 16)),
+                    max_length=int(self._rerank_cfg.get("max_length", 512)),
+                    allow_download=bool(self._rerank_cfg.get("allow_download", False)),
+                )
+                logger.info(
+                    "Rerank 精排已启用（模型懒加载）：model=%s  mode=%s  score_threshold=%s",
+                    self._rerank_cfg.get("model"),
+                    self._rerank_cfg.get("mode", "filter"),
+                    self._rerank_cfg.get("score_threshold"),
+                )
+        else:
+            logger.info("Rerank 精排未启用（rerank.enabled=False），检索行为与改造前一致")
 
         self.initialized = True
         self._milvus_db_path = milvus_db_path  # 保存路径用于重连
@@ -401,9 +472,18 @@ class RAGKnowledgeAgent(AgentBase):
           量级只有 1/(k+rank) ≈ 0.008~0.03，两者量纲完全不同。
           因此阈值**只作用于向量路**，BM25 单路命中走独立的 min_bm25_score 准入。
           否则把 0.5 套到 RRF 分数上会把所有结果过滤光。
+
+        精排（可选）：RRF 融合后先保留 rrf_candidates 条候选池，再交给 apply_rerank。
+          详见 utils/reranker.py —— 实测默认走 mode="filter"（RRF 排序 + 精排当闸门），
+          而非用精排重排。
         """
         cfg = self._hybrid_cfg or {}
         final_k = int(top_k or cfg.get("final_top_k") or self.top_k)
+        use_rerank = self._reranker is not None
+        cand_k = (
+            max(final_k, int(cfg.get("rrf_candidates", final_k)))
+            if use_rerank else final_k
+        )
         kd = int(cfg.get("top_k_dense", 10))
         ks = int(cfg.get("top_k_sparse", 10))
         rrf_k = int(cfg.get("rrf_k", 60))
@@ -431,8 +511,15 @@ class RAGKnowledgeAgent(AgentBase):
             return []
 
         # ---- RRF 融合 ----
+        # 通道权重可配：只有 dense:sparse 的**比值**有意义。
+        # 实测纯 BM25 单独跑 Hit@3=53/53 而等权混合只有 51/53，故默认仍留 1:1，
+        # 具体取值由 scripts/tune_rrf_weights.py 扫描确定。
+        dense_w = float(cfg.get("dense_weight", 1.0))
+        sparse_w = float(cfg.get("sparse_weight", 1.0))
         dense_ranked = [(d["id"], d["distance"]) for d in dense]
-        fused = reciprocal_rank_fusion([dense_ranked, sparse], k=rrf_k)
+        fused = reciprocal_rank_fusion(
+            [dense_ranked, sparse], k=rrf_k, weights=[dense_w, sparse_w]
+        )
 
         by_id = {d["id"]: d for d in dense}
         sparse_ids = {cid for cid, _ in sparse}
@@ -456,8 +543,30 @@ class RAGKnowledgeAgent(AgentBase):
                 }
             item["rrf_score"] = round(rrf_score, 6)
             out.append(item)
-            if len(out) >= final_k:
-                break
+
+        # ---- 同一文档限流：防同文档 chunk 占满 Top-K ----
+        # RRF 按排名累加，一个文档的多个 chunk 各自贡献分数，等于变相加权，
+        # 还会挤占槽位（实测「紧急出差可以后补审批吗」返回 3 条全是 04_faq.txt）。
+        max_per_doc = int(cfg.get("max_per_doc", 1) or 0)
+        raw_n = len(out)
+        out = limit_per_doc(out, max_per_doc=max_per_doc, limit=cand_k)
+        if max_per_doc and len(out) < raw_n:
+            logger.info(
+                "同文档限流（max_per_doc=%d）：候选 %d → %d 条",
+                max_per_doc, raw_n, len(out),
+            )
+
+        # 精排模块导入失败时 apply_rerank 为 None，必须跳过——否则 TypeError 会被
+        # search_knowledge 的 except 吞掉，表现为「混合检索静默返回空、RAG 永远答不知道」
+        if apply_rerank is not None:
+            out = apply_rerank(
+                self._reranker,
+                query,
+                out,
+                top_k=final_k,
+                score_threshold=self._rerank_cfg.get("score_threshold"),
+                mode=str(self._rerank_cfg.get("mode", "filter")),
+            )
 
         logger.info(
             "混合检索返回 %d 条（来源：%s）",
@@ -646,6 +755,13 @@ class RAGKnowledgeAgent(AgentBase):
                     logger.info("Milvus client closed successfully")
             except Exception as e:
                 logger.warning(f"Error closing Milvus client: {e}")
+        # 精排模型（CPU 内存）显式释放；用 getattr 兼容未初始化的早退路径
+        reranker = getattr(self, "_reranker", None)
+        if reranker is not None:
+            try:
+                reranker.unload()
+            except Exception as e:
+                logger.warning(f"Error unloading reranker: {e}")
 
     def __del__(self):
         """析构函数，确保资源被释放"""

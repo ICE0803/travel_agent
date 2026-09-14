@@ -18,7 +18,12 @@ except Exception:
 
 # 需要模块对象本身，才能在测试里临时切换分词后端
 import utils.hybrid_retriever as hr
-from utils.hybrid_retriever import BM25Index, reciprocal_rank_fusion, tokenize
+from utils.hybrid_retriever import (
+    BM25Index,
+    limit_per_doc,
+    reciprocal_rank_fusion,
+    tokenize,
+)
 
 PASSED, FAILED = [], []
 
@@ -136,6 +141,34 @@ def main():
     check("空语料 search 返回空", empty.search("x") == [])
     check("空查询返回空", idx.search("") == [])
     check("纯标点查询返回空", idx.search("，。！") == [])
+
+    print("\n[13] limit_per_doc：同文档限流（防同文档 chunk 占满 Top-K）")
+    # 复刻实测场景：04_faq 有 3 个 chunk 被召回，把正确文档挤出 Top-3
+    D = [
+        {"id": 1, "metadata": {"parent_doc": "04_faq"}},
+        {"id": 2, "metadata": {"parent_doc": "04_faq"}},
+        {"id": 3, "metadata": {"parent_doc": "12_seasonal"}},
+        {"id": 4, "metadata": {"parent_doc": "04_faq"}},
+        {"id": 5, "metadata": {"parent_doc": "01_standards"}},
+        {"id": 6, "metadata": {"parent_doc": "12_seasonal"}},
+    ]
+    check("max_per_doc=1：每篇只留 1 条",
+          [d["id"] for d in limit_per_doc(D, max_per_doc=1)] == [1, 3, 5],
+          str([d["id"] for d in limit_per_doc(D, max_per_doc=1)]))
+    check("max_per_doc=2：每篇最多 2 条",
+          [d["id"] for d in limit_per_doc(D, max_per_doc=2)] == [1, 2, 3, 5, 6])
+    check("max_per_doc=0：不限制（原序全留）",
+          [d["id"] for d in limit_per_doc(D, max_per_doc=0)] == [1, 2, 3, 4, 5, 6])
+    check("limit=3 截断，且 12_seasonal 能进 Top-3",
+          [d["id"] for d in limit_per_doc(D, max_per_doc=1, limit=3)] == [1, 3, 5])
+    check("保持原有相对顺序", [d["id"] for d in limit_per_doc(D, 1)] == sorted(
+        [d["id"] for d in limit_per_doc(D, 1)]))
+    check("空输入返回空", limit_per_doc([], max_per_doc=1) == [])
+    check("metadata 为 None 不崩溃（退化为按 id 去重 = 不去重）",
+          len(limit_per_doc([{"id": 7}, {"id": 8, "metadata": None}], max_per_doc=1)) == 2)
+    check("parent_doc 缺失时按 id 去重",
+          len(limit_per_doc([{"id": 9}, {"id": 9}], max_per_doc=1)) == 1)
+    check("不修改入参", len(D) == 6 and all("_x" not in d for d in D))
 
     print(f"\n通过 {len(PASSED)} / {len(PASSED) + len(FAILED)}")
     if FAILED:

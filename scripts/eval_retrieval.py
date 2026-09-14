@@ -59,7 +59,9 @@ CASES = [
     ("超标住宿费由谁审批",              "01_travel_standards.txt"),
     ("西藏新疆出差住宿标准能上浮多少",    "01_travel_standards.txt"),
     ("三线及以下城市的住宿标准",         "01_travel_standards.txt"),
-    ("国际长途航班可以订什么舱位",        "01_travel_standards.txt"),
+    # 01 行31「国际长途航线（4小时以上）：可预订高端经济舱」
+    # 与 10 行46「航程4小时以上：可预订高端经济舱」写的**是同一条规则**，两篇都算对
+    ("国际长途航班可以订什么舱位",        ("01_travel_standards.txt", "10_international_travel.txt")),
 
     # ---- 02 报销规定 ----
     ("出差结束后多少天内要提交报销",      "02_reimbursement_policy.txt"),
@@ -131,7 +133,11 @@ CASES = [
     ("广交会期间要提前多久预订",         "12_seasonal_policies.txt"),
     ("旺季住宿标准能上浮多少",           "12_seasonal_policies.txt"),
     ("出差期间被隔离费用由谁承担",        "12_seasonal_policies.txt"),
-    ("紧急出差可以后补审批吗",           "12_seasonal_policies.txt"),
+    # 三篇都**直接回答了**该问题（逐行核对原文，非按检索结果倒推）：
+    #   12 行115/116「可先出差后补审批，需在出发前告知直属主管；返回后3个工作日内完成」
+    #   04 行6      「紧急出差可以特事特办，返回后3日内补齐审批手续」
+    #   01 行19     「紧急情况下可先出差后补审批，返回后3日内完成」
+    ("紧急出差可以后补审批吗",           ("12_seasonal_policies.txt", "04_faq.txt", "01_travel_standards.txt")),
 ]
 
 # 负例：知识库里不该有答案的查询，用于标定 min_bm25_score

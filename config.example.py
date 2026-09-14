@@ -10,7 +10,8 @@ RAG_CONFIG = {
     "embedding_model": "data/models/bge-small-zh-v1.5",
     # 向量路余弦阈值（防幻觉）。用 scripts/eval_retrieval.py 实测可分区间后取中点；
     # 区间内任意值对 Hit@k / MRR 完全等价，只影响鲁棒性余量。
-    "similarity_threshold": 0.51,
+    # 当前实测可分区间 (0.482, 0.545)，中点即 0.514。
+    "similarity_threshold": 0.514,
     "hybrid": {
         "enabled": True,        # False 则退回纯向量检索（用于 A/B 对比）
         "top_k_dense": 10,      # 向量路召回条数

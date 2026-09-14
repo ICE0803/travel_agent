@@ -511,9 +511,12 @@ class RAGKnowledgeAgent(AgentBase):
             return []
 
         # ---- RRF 融合 ----
-        # 通道权重可配：只有 dense:sparse 的**比值**有意义。
-        # 实测纯 BM25 单独跑 Hit@3=53/53 而等权混合只有 51/53，故默认仍留 1:1，
-        # 具体取值由 scripts/tune_rrf_weights.py 扫描确定。
+        # 通道权重可配：只有 dense:sparse 的**比值**有意义，具体取值见 config.py 的
+        # dense_weight / sparse_weight（生产为 1.0:1.5），由 scripts/tune_rrf_weights.py 扫描确定。
+        # ⚠ 早期注释写的「纯 BM25 Hit@3=53/53 而等权混合只有 51/53」**已作废**：
+        #   那是两条用例标注过窄造成的假象，修正标注后混合同为 53/53（见 README
+        #   「RRF 的 chunk 数偏置」）。此处保留 1:1 仅作为代码兜底默认值，
+        #   生产实际值由 config 覆盖。
         dense_w = float(cfg.get("dense_weight", 1.0))
         sparse_w = float(cfg.get("sparse_weight", 1.0))
         dense_ranked = [(d["id"], d["distance"]) for d in dense]

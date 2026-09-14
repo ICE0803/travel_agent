@@ -170,7 +170,7 @@
 | **混合（RRF）** | **50/53** | 51/53 | **0.953** |
 | 混合 + 精排重排 | 50/53 | 52/53 | 0.959 |
 
-精排分数当**准入闸门**时（`score_threshold=0.264`），负例拦截从 1/6 提升到 **6/6**，正例保住 52/53。参数见 `config.py` → `RAG_CONFIG`，实现见 `utils/hybrid_retriever.py` / `utils/reranker.py`；**调优过程与两个被实测否掉的假设**见下方「检索调优实验记录」。
+精排分数当**准入闸门**时（`score_threshold=0.264`），负例拦截从 1/6 提升到 **6/6**，正例保住 52/53。参数见 `config.py` → `RAG_CONFIG`，实现见 `utils/hybrid_retriever.py` / `utils/reranker.py`。
 
 ### 4. 信息查询（联网搜索）
 
